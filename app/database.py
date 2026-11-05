@@ -1,7 +1,7 @@
 
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -17,10 +17,21 @@ engine = create_engine(
 )
 
 
+# Enable SQLite foreign key enforcement for every connection
+@event.listens_for(engine, "connect")
+def enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
 # Create a database session factory
 SessionLocal = sessionmaker(
     bind=engine,
-    autoflush=False
+    autoflush=False,
+    expire_on_commit=False
 )
 
 

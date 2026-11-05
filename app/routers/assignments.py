@@ -6,18 +6,72 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User, Manuscript, ReviewAssignment
-from app.schemas import (
-    ReviewAssignmentCreate,
-    ReviewAssignmentResponse,
-)
+from app.models import User, Manuscript, ReviewAssignment, Review
+from app.schemas import ReviewAssignmentCreate, ReviewAssignmentResponse
 from app.routers.users import require_role
+from app.routers.manuscripts import manuscript_has_pdf
 
 
 router = APIRouter(
     prefix="/assignments",
     tags=["Review Assignments"]
 )
+
+
+def assignment_to_response(
+    assignment: ReviewAssignment,
+    manuscript: Manuscript
+) -> ReviewAssignmentResponse:
+    """Include manuscript information without changing database tables."""
+    response = ReviewAssignmentResponse.model_validate(assignment)
+
+    return response.model_copy(update={
+        "manuscript_title": manuscript.title,
+        "manuscript_status": manuscript.status,
+        "has_pdf": manuscript_has_pdf(manuscript),
+    })
+
+
+def assignments_to_responses(
+    db: Session,
+    assignments: list[ReviewAssignment]
+) -> list[ReviewAssignmentResponse]:
+    """Load related manuscripts in one query to avoid per-row DB lookups."""
+    if not assignments:
+        return []
+
+    manuscript_ids = {
+        assignment.manuscript_id
+        for assignment in assignments
+    }
+
+    manuscripts = db.scalars(
+        select(Manuscript).where(
+            Manuscript.manuscript_id.in_(manuscript_ids)
+        )
+    ).all()
+
+    by_id = {
+        manuscript.manuscript_id: manuscript
+        for manuscript in manuscripts
+    }
+
+    result = []
+
+    for assignment in assignments:
+        manuscript = by_id.get(assignment.manuscript_id)
+
+        if manuscript is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Assignment references a missing manuscript"
+            )
+
+        result.append(
+            assignment_to_response(assignment, manuscript)
+        )
+
+    return result
 
 
 # Editor: Assign a reviewer to a manuscript
@@ -46,16 +100,15 @@ def assign_reviewer(
             detail="Manuscript not found"
         )
 
-    # Step 2: Validate manuscript status and review round
-    if manuscript.status == "submitted":
-        expected_round = 1
-    elif manuscript.status == "revised":
-        expected_round = 2
-    else:
+    # Step 2: Validate manuscript status
+    if manuscript.status not in ("submitted", "revised"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Manuscript is not available for reviewer assignment"
         )
+
+    # Step 3: Use the manuscript's current review round
+    expected_round = manuscript.review_round
 
     if assignment_data.review_round != expected_round:
         raise HTTPException(
@@ -63,7 +116,7 @@ def assign_reviewer(
             detail=f"This manuscript requires review round {expected_round}"
         )
 
-    # Step 3: Find the reviewer
+    # Step 4: Find the reviewer
     reviewer = db.get(
         User,
         assignment_data.reviewer_id
@@ -81,12 +134,12 @@ def assign_reviewer(
             detail="Selected user is not a reviewer"
         )
 
-    # Step 4: Prevent duplicate assignments in the same round
+    # Step 5: Prevent duplicate assignments in the same round
     existing_assignment = db.scalar(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == assignment_data.manuscript_id,
             ReviewAssignment.reviewer_id == assignment_data.reviewer_id,
-            ReviewAssignment.review_round == assignment_data.review_round
+            ReviewAssignment.review_round == expected_round
         )
     )
 
@@ -96,12 +149,12 @@ def assign_reviewer(
             detail="Reviewer already assigned in this review round"
         )
 
-    # Step 5: Create the assignment
+    # Step 6: Create the assignment
     new_assignment = ReviewAssignment(
         manuscript_id=assignment_data.manuscript_id,
         reviewer_id=assignment_data.reviewer_id,
         assigned_by=current_user.user_id,
-        review_round=assignment_data.review_round,
+        review_round=expected_round,
         status="assigned"
     )
 
@@ -109,7 +162,7 @@ def assign_reviewer(
     db.commit()
     db.refresh(new_assignment)
 
-    return new_assignment
+    return assignment_to_response(new_assignment, manuscript)
 
 
 # Editor: View all review assignments
@@ -131,7 +184,7 @@ def get_all_assignments(
         )
     ).all()
 
-    return assignments
+    return assignments_to_responses(db, assignments)
 
 
 # Reviewer: View their own assignments
@@ -148,16 +201,19 @@ def get_my_assignments(
     db: Session = Depends(get_db)
 ):
     assignments = db.scalars(
-        select(ReviewAssignment).where(
+        select(ReviewAssignment)
+        .where(
             ReviewAssignment.reviewer_id == current_user.user_id
-        ).order_by(
+        )
+        .order_by(
             ReviewAssignment.assignment_id
         )
     ).all()
 
-    return assignments
+    return assignments_to_responses(db, assignments)
 
 
+# Editor: View all assignments for a manuscript
 @router.get(
     "/manuscript/{manuscript_id}",
     response_model=list[ReviewAssignmentResponse],
@@ -171,7 +227,6 @@ def get_manuscript_review_progress(
     ],
     db: Session = Depends(get_db)
 ):
-    # Step 1: Check whether the manuscript exists
     manuscript = db.get(Manuscript, manuscript_id)
 
     if manuscript is None:
@@ -180,7 +235,6 @@ def get_manuscript_review_progress(
             detail="Manuscript not found"
         )
 
-    # Step 2: Find all review assignments for this manuscript
     assignments = db.scalars(
         select(ReviewAssignment)
         .where(
@@ -192,10 +246,13 @@ def get_manuscript_review_progress(
         )
     ).all()
 
-    # Step 3: Return the review progress
-    return assignments
+    return [
+        assignment_to_response(assignment, manuscript)
+        for assignment in assignments
+    ]
 
 
+# Editor: Get current review round summary
 @router.get(
     "/manuscript/{manuscript_id}/summary",
     summary="Get Manuscript Review Summary"
@@ -208,7 +265,7 @@ def get_manuscript_review_summary(
     ],
     db: Session = Depends(get_db)
 ):
-    # Step 1: Check whether the manuscript exists
+    # Step 1: Find manuscript
     manuscript = db.get(Manuscript, manuscript_id)
 
     if manuscript is None:
@@ -217,28 +274,10 @@ def get_manuscript_review_summary(
             detail="Manuscript not found"
         )
 
-    # Step 2: Determine the current review round
-    if manuscript.status == "revised":
-        review_round = 2
-    else:
-        # Use the latest existing review round
-        latest_assignment = db.scalar(
-            select(ReviewAssignment)
-            .where(
-                ReviewAssignment.manuscript_id == manuscript_id
-            )
-            .order_by(
-                ReviewAssignment.review_round.desc()
-            )
-        )
+    # Step 2: Use current review round
+    review_round = manuscript.review_round
 
-        review_round = (
-            latest_assignment.review_round
-            if latest_assignment is not None
-            else 1
-        )
-
-    # Step 3: Get assignments for the current round
+    # Step 3: Get assignments for current round
     assignments = db.scalars(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == manuscript_id,
@@ -246,21 +285,32 @@ def get_manuscript_review_summary(
         )
     ).all()
 
-    # Step 4: Count review progress
+    # Step 4: Find completed reviews
+    assignment_ids = [
+        assignment.assignment_id
+        for assignment in assignments
+    ]
+
+    reviewed_ids = set()
+
+    if assignment_ids:
+        reviewed_ids = set(
+            db.scalars(
+                select(Review.assignment_id).where(
+                    Review.assignment_id.in_(assignment_ids)
+                )
+            ).all()
+        )
+
+    # Step 5: Calculate progress
     total_reviewers = len(assignments)
 
     completed_reviews = sum(
-        1 for assignment in assignments
-        if assignment.status == "completed"
+        assignment.assignment_id in reviewed_ids
+        for assignment in assignments
     )
 
     pending_reviews = total_reviewers - completed_reviews
-
-    # Step 5: Check whether all reviews are completed
-    all_reviews_completed = (
-        total_reviewers > 0
-        and pending_reviews == 0
-    )
 
     # Step 6: Return summary
     return {
@@ -269,5 +319,8 @@ def get_manuscript_review_summary(
         "total_reviewers": total_reviewers,
         "completed_reviews": completed_reviews,
         "pending_reviews": pending_reviews,
-        "all_reviews_completed": all_reviews_completed
+        "all_reviews_completed": (
+            total_reviewers > 0
+            and pending_reviews == 0
+        )
     }

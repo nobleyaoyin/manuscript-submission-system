@@ -21,6 +21,7 @@ router = APIRouter(
 )
 
 
+# Reviewer: Submit a review
 @router.post(
     "/",
     response_model=ReviewResponse,
@@ -66,18 +67,16 @@ def submit_review(
             detail="Manuscript not found"
         )
 
-    # Step 4: Determine the current review round
-    if manuscript.status == "submitted":
-        current_round = 1
-    elif manuscript.status == "revised":
-        current_round = 2
-    else:
+    # Step 4: Check manuscript status
+    if manuscript.status not in ("submitted", "revised"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Manuscript is not open for review"
         )
 
-    # Step 5: Validate the review round
+    # Step 5: Use the manuscript's current review round
+    current_round = manuscript.review_round
+
     if assignment.review_round != current_round:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -97,7 +96,14 @@ def submit_review(
             detail="Review already submitted for this assignment"
         )
 
-    # Step 7: Create the review
+    # Step 7: Check assignment status
+    if assignment.status != "assigned":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This assignment is not available for review"
+        )
+
+    # Step 8: Create the review
     review = Review(
         assignment_id=assignment.assignment_id,
         comments=review_data.comments,
@@ -106,17 +112,17 @@ def submit_review(
 
     db.add(review)
 
-    # Step 8: Mark assignment as completed
+    # Step 9: Mark assignment as completed
     assignment.status = "completed"
 
-    # Step 9: Save changes
+    # Step 10: Save changes
     db.commit()
     db.refresh(review)
 
     return review
 
 
-
+# Editor: View manuscript review history
 @router.get(
     "/manuscript/{manuscript_id}",
     response_model=list[ReviewHistoryResponse],
@@ -155,7 +161,7 @@ def get_manuscript_reviews(
         )
     ).all()
 
-    # Step 3: Build the review history response
+    # Step 3: Build review history
     history = []
 
     for review, assignment in results:

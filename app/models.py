@@ -71,6 +71,13 @@ class Manuscript(Base):
         default="submitted"
     )
 
+    # Current review round of the manuscript
+    review_round: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        nullable=False
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc)

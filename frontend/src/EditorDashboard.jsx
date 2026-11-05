@@ -83,9 +83,14 @@ function EditorDashboard({ user, token, onLogout }) {
 
       setManuscripts(manuscriptsData);
       setSummary(summaryData);
+      // Previously fetched review history may be outdated after refresh.
+      setReviewHistory({});
 
       return true;
     } catch (err) {
+      setManuscripts([]);
+      setSummary(null);
+      setReviewHistory({});
       setError(err.message || "Failed to load dashboard.");
       return false;
     } finally {
@@ -103,9 +108,7 @@ function EditorDashboard({ user, token, onLogout }) {
 
   // Determine active review round
   const getActiveRound = (manuscript) =>
-    manuscript.status === "revised"
-      ? 2
-      : manuscript.review_round || 1;
+    manuscript.review_round || (manuscript.status === "revised" ? 2 : 1);
 
   // Avoid using previous-round counts for revised manuscripts
   const getCurrentRoundProgress = (manuscript) => {
@@ -125,6 +128,25 @@ function EditorDashboard({ user, token, onLogout }) {
       completed: manuscript.completed_reviews ?? 0,
       pending: manuscript.pending_reviews ?? 0,
       reviewStatus: manuscript.review_status || "not_assigned",
+    };
+  };
+
+  // Group reviews by round without changing the backend response.
+  const groupReviewsByRound = (reviews) => {
+    const groups = new Map();
+    for (const review of reviews) {
+      const round = Number(review.review_round) || 1;
+      if (!groups.has(round)) groups.set(round, []);
+      groups.get(round).push(review);
+    }
+    return [...groups.entries()].sort(([a], [b]) => a - b);
+  };
+
+  const getRecommendationSummary = (reviews) => {
+    const unique = [...new Set(reviews.map((review) => review.recommendation).filter(Boolean))];
+    return {
+      conflicting: unique.length > 1,
+      unique,
     };
   };
 
@@ -151,6 +173,14 @@ function EditorDashboard({ user, token, onLogout }) {
   // Download manuscript PDF
   const handleDownload = async (manuscriptId) => {
     if (actionLock.current) return;
+
+    const manuscript = manuscripts.find(
+      (item) => item.manuscript_id === manuscriptId
+    );
+    if (!manuscript?.has_pdf) {
+      setError("No PDF is available for this manuscript.");
+      return;
+    }
 
     actionLock.current = true;
     setActionLoadingId(manuscriptId);
@@ -400,7 +430,7 @@ function EditorDashboard({ user, token, onLogout }) {
           </button>
         </div>
 
-        {error && (
+        {error && expandedId === null && (
           <div className="editor-error" role="alert">
             {error}
           </div>
@@ -526,22 +556,31 @@ function EditorDashboard({ user, token, onLogout }) {
 
                         {isExpanded && (
                           <div className="editor-actions">
+                            {error && (
+                              <div className="editor-error" role="alert">
+                                {error}
+                              </div>
+                            )}
                             {/* PDF Download */}
                             <div className="editor-action-block">
                               <h4>Manuscript PDF</h4>
 
-                              <button
-                                type="button"
-                                className="editor-secondary-button"
-                                disabled={isBusy}
-                                onClick={() =>
-                                  handleDownload(manuscriptId)
-                                }
-                              >
-                                {actionLoadingId === manuscriptId
-                                  ? "Processing..."
-                                  : "Download PDF"}
-                              </button>
+                              {manuscript.has_pdf ? (
+                                <button
+                                  type="button"
+                                  className="editor-secondary-button"
+                                  disabled={isBusy}
+                                  onClick={() =>
+                                    handleDownload(manuscriptId)
+                                  }
+                                >
+                                  {actionLoadingId === manuscriptId
+                                    ? "Processing..."
+                                    : "Download PDF"}
+                                </button>
+                              ) : (
+                                <p>No PDF Uploaded</p>
+                              )}
                             </div>
 
                             {/* Assign Reviewer */}
@@ -613,33 +652,39 @@ function EditorDashboard({ user, token, onLogout }) {
                                   {reviewHistory[manuscriptId].length === 0 ? (
                                     <p>No reviews submitted yet.</p>
                                   ) : (
-                                    reviewHistory[manuscriptId].map(
-                                      (review) => (
-                                        <div
-                                          className="editor-review-item"
-                                          key={review.review_id}
-                                        >
-                                          <p>
-                                            <strong>
-                                              Review Round{" "}
-                                              {review.review_round}
-                                            </strong>
-                                            {" · "}
-                                            Reviewer #{review.reviewer_id}
-                                          </p>
-
-                                          <p>
-                                            Recommendation:{" "}
-                                            <strong>
-                                              {formatStatus(
-                                                review.recommendation
-                                              )}
-                                            </strong>
-                                          </p>
-
-                                          <p>{review.comments}</p>
-                                        </div>
-                                      )
+                                    groupReviewsByRound(reviewHistory[manuscriptId]).map(
+                                      ([round, reviews]) => {
+                                        const summary = getRecommendationSummary(reviews);
+                                        return (
+                                          <section key={round} style={{ marginBottom: "1.25rem" }}>
+                                            <h4 style={{ marginBottom: "0.75rem" }}>
+                                              Review Round {round} · {reviews.length} submitted
+                                            </h4>
+                                            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
+                                              {reviews.map((review) => (
+                                                <span
+                                                  key={review.review_id}
+                                                  style={{ border: "1px solid #cbd5e1", borderRadius: "0.5rem", padding: "0.35rem 0.65rem" }}
+                                                >
+                                                  Reviewer #{review.reviewer_id}: <strong>{formatStatus(review.recommendation)}</strong>
+                                                </span>
+                                              ))}
+                                            </div>
+                                            {summary.conflicting && (
+                                              <p role="status" style={{ color: "#92400e", background: "#fffbeb", padding: "0.75rem", borderRadius: "0.5rem" }}>
+                                                Conflicting reviewer recommendations in Round {round}. The editor must evaluate the comments and make the final decision.
+                                              </p>
+                                            )}
+                                            {reviews.map((review) => (
+                                              <div className="editor-review-item" key={review.review_id}>
+                                                <p><strong>Reviewer #{review.reviewer_id}</strong> · Round {round}</p>
+                                                <p>Recommendation: <strong>{formatStatus(review.recommendation)}</strong></p>
+                                                <p>{review.comments}</p>
+                                              </div>
+                                            ))}
+                                          </section>
+                                        );
+                                      }
                                     )
                                   )}
                                 </div>
@@ -657,6 +702,17 @@ function EditorDashboard({ user, token, onLogout }) {
                                       All assigned reviewers have completed
                                       their reviews.
                                     </p>
+
+                                    {reviewHistory[manuscriptId] &&
+                                      getRecommendationSummary(
+                                        reviewHistory[manuscriptId].filter(
+                                          (review) => Number(review.review_round) === activeRound
+                                        )
+                                      ).conflicting && (
+                                        <p role="status" style={{ color: "#92400e" }}>
+                                          Current-round reviewers disagree. Review their comments before submitting a final decision.
+                                        </p>
+                                      )}
 
                                     <div className="editor-action-row">
                                       <select

@@ -1,12 +1,16 @@
 from typing import Annotated
 
 from pathlib import Path
+from datetime import datetime, timezone
+from uuid import uuid4
+import os
+import tempfile
 from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from app.database import get_db
+from app.database import get_db, BASE_DIR
 from app.models import Manuscript, User, ReviewAssignment, Review
 from app.schemas import ManuscriptCreate, ManuscriptResponse, ManuscriptUpdate, EditorDecision
 from app.routers.users import get_current_user, require_role
@@ -15,6 +19,59 @@ router = APIRouter(
     prefix="/manuscripts",
     tags=["Manuscripts"]
 )
+
+
+
+# Resolve existing relative paths from the project root.
+def resolve_manuscript_file_path(stored_path: str) -> Path:
+    path = Path(stored_path)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def manuscript_has_pdf(manuscript: Manuscript) -> bool:
+    """True only when the current manuscript PDF exists on disk."""
+    if not manuscript.file_path:
+        return False
+    return resolve_manuscript_file_path(manuscript.file_path).is_file()
+
+
+def manuscript_to_response(manuscript: Manuscript) -> ManuscriptResponse:
+    """Serialize a manuscript with its computed PDF availability."""
+    response = ManuscriptResponse.model_validate(manuscript)
+    return response.model_copy(update={"has_pdf": manuscript_has_pdf(manuscript)})
+
+
+def get_current_review_round(db: Session, manuscript: Manuscript) -> int:
+    """Read the persisted round; older records fall back to assignment history."""
+    stored_round = getattr(manuscript, "review_round", None)
+    if isinstance(stored_round, int) and stored_round >= 1:
+        return stored_round
+
+    latest_round = db.scalar(
+        select(ReviewAssignment.review_round)
+        .where(ReviewAssignment.manuscript_id == manuscript.manuscript_id)
+        .order_by(ReviewAssignment.review_round.desc())
+        .limit(1)
+    )
+    return latest_round or 1
+
+
+def can_access_manuscript(db: Session, manuscript: Manuscript, user: User) -> bool:
+    if manuscript.author_id == user.user_id:
+        return True
+    if manuscript.status == "draft":
+        return False
+    if user.role == "editor":
+        return True
+    if user.role != "reviewer":
+        return False
+    assignment = db.scalar(
+        select(ReviewAssignment.assignment_id).where(
+            ReviewAssignment.manuscript_id == manuscript.manuscript_id,
+            ReviewAssignment.reviewer_id == user.user_id
+        ).limit(1)
+    )
+    return assignment is not None
 
 
 @router.post(
@@ -32,7 +89,8 @@ def create_manuscript(
         title=manuscript_data.title,
         abstract=manuscript_data.abstract,
         author_id=current_user.user_id,
-        status="submitted"
+        status="draft",
+        review_round=1
     )
 
     # Save the manuscript
@@ -40,7 +98,35 @@ def create_manuscript(
     db.commit()
     db.refresh(new_manuscript)
 
-    return new_manuscript
+    return manuscript_to_response(new_manuscript)
+
+
+@router.post(
+    "/{manuscript_id}/submit",
+    response_model=ManuscriptResponse,
+    summary="Submit Draft Manuscript"
+)
+def submit_draft_manuscript(
+    manuscript_id: int,
+    current_user: User = Depends(require_role("author")),
+    db: Session = Depends(get_db)
+):
+    manuscript = db.get(Manuscript, manuscript_id)
+    if manuscript is None:
+        raise HTTPException(status_code=404, detail="Manuscript not found")
+    if manuscript.author_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="You can only submit your own drafts")
+    if manuscript.status != "draft":
+        raise HTTPException(status_code=409, detail="Only draft manuscripts can be submitted")
+    if not manuscript.title.strip() or not manuscript.abstract.strip():
+        raise HTTPException(status_code=409, detail="Title and abstract are required")
+    if not manuscript_has_pdf(manuscript):
+        raise HTTPException(status_code=409, detail="A PDF is required before submission")
+
+    manuscript.status = "submitted"
+    db.commit()
+    db.refresh(manuscript)
+    return manuscript_to_response(manuscript)
 
 
 # Editor: View all manuscripts with optional status filtering
@@ -55,7 +141,7 @@ def get_all_manuscripts(
     db: Session = Depends(get_db)
 ):
     # Start with all manuscripts
-    query = select(Manuscript)
+    query = select(Manuscript).where(Manuscript.status != "draft")
 
     # Filter by status if provided
     if status is not None:
@@ -66,7 +152,7 @@ def get_all_manuscripts(
 
     manuscripts = db.scalars(query).all()
 
-    return manuscripts
+    return [manuscript_to_response(item) for item in manuscripts]
 
 
 # Editor: Dashboard statistics by manuscript status
@@ -82,8 +168,8 @@ def get_manuscript_statistics(
     )
     counts = {name: 0 for name in statuses}
 
-    # Count all manuscripts, including any unexpected status values.
-    manuscripts = db.scalars(select(Manuscript)).all()
+    # Count submitted manuscripts; drafts are private to their authors.
+    manuscripts = db.scalars(select(Manuscript).where(Manuscript.status != "draft")).all()
     for manuscript in manuscripts:
         if manuscript.status in counts:
             counts[manuscript.status] += 1
@@ -99,23 +185,14 @@ def get_editor_dashboard(
 ):
     # Step 1: Get all manuscripts
     manuscripts = db.scalars(
-        select(Manuscript).order_by(Manuscript.manuscript_id)
+        select(Manuscript).where(Manuscript.status != "draft").order_by(Manuscript.manuscript_id)
     ).all()
 
     dashboard = []
 
     for manuscript in manuscripts:
         # Step 2: Determine the review round
-        round_query = db.scalar(
-            select(ReviewAssignment.review_round)
-            .where(
-                ReviewAssignment.manuscript_id == manuscript.manuscript_id
-            )
-            .order_by(ReviewAssignment.review_round.desc())
-            .limit(1)
-        )
-
-        review_round = round_query or 1
+        review_round = get_current_review_round(db, manuscript)
 
         # Step 3: Get assignments for the current round
         assignments = db.scalars(
@@ -162,6 +239,7 @@ def get_editor_dashboard(
             "manuscript_id": manuscript.manuscript_id,
             "title": manuscript.title,
             "status": manuscript.status,
+            "has_pdf": manuscript_has_pdf(manuscript),
             "review_round": review_round,
             "total_reviewers": total_reviewers,
             "completed_reviews": completed_reviews,
@@ -183,7 +261,7 @@ def get_editor_dashboard_summary(
     current_user: User = Depends(require_role("editor")),
     db: Session = Depends(get_db)
 ):
-    manuscripts = db.scalars(select(Manuscript)).all()
+    manuscripts = db.scalars(select(Manuscript).where(Manuscript.status != "draft")).all()
 
     summary = {
         "total_manuscripts": len(manuscripts),
@@ -203,8 +281,8 @@ def get_editor_dashboard_summary(
             summary["revision_required"] += 1
             continue
 
-        # Review round is based on the manuscript's current workflow state.
-        review_round = 2 if manuscript.status == "revised" else 1
+        # Use the same round calculation as the editor dashboard.
+        review_round = get_current_review_round(db, manuscript)
 
         assignments = db.scalars(
             select(ReviewAssignment).where(
@@ -249,7 +327,7 @@ def get_my_manuscripts(
         .order_by(Manuscript.manuscript_id)
     ).all()
 
-    return manuscripts
+    return [manuscript_to_response(item) for item in manuscripts]
 
 
 
@@ -275,7 +353,7 @@ def get_manuscript(
     is_author = manuscript.author_id == current_user.user_id
 
     # Check whether the user is an editor
-    is_editor = current_user.role == "editor"
+    is_editor = current_user.role == "editor" and manuscript.status != "draft"
 
     # Check whether the reviewer is assigned to this manuscript
     is_assigned_reviewer = False
@@ -297,7 +375,7 @@ def get_manuscript(
             detail="Manuscript not found"
         )
 
-    return manuscript
+    return manuscript_to_response(manuscript)
 
 
 
@@ -325,7 +403,7 @@ def update_manuscript(
         )
 
     # Only allow editing before the first review assignment
-    if manuscript.status != "submitted":
+    if manuscript.status not in ("draft", "submitted"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Manuscript cannot be edited at this stage"
@@ -361,7 +439,7 @@ def update_manuscript(
     db.commit()
     db.refresh(manuscript)
 
-    return manuscript
+    return manuscript_to_response(manuscript)
 
 @router.delete(
     "/{manuscript_id}",
@@ -393,8 +471,8 @@ def delete_manuscript(
             detail="You can only delete your own manuscripts"
         )
 
-    # Only submitted manuscripts can be deleted
-    if manuscript.status != "submitted":
+    # Only draft and unassigned legacy submitted manuscripts can be deleted
+    if manuscript.status not in ("draft", "submitted"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Manuscript cannot be deleted at this stage"
@@ -440,16 +518,13 @@ def make_editor_decision(
             detail="Manuscript not found"
         )
 
-    # Step 2: Determine the current review round
-    if manuscript.status == "submitted":
-        current_round = 1
-    elif manuscript.status == "revised":
-        current_round = 2
-    else:
+    # Step 2: Decisions are permitted only while a round is under review.
+    if manuscript.status not in ("submitted", "revised"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Manuscript is not ready for an editor decision"
         )
+    current_round = get_current_review_round(db, manuscript)
 
     # Step 3: Find assignments for the current review round
     assignments = db.scalars(
@@ -546,14 +621,16 @@ def resubmit_manuscript(
 
         setattr(manuscript, field, value)
 
-    # Step 5: Change status to revised
+    # Step 5: Advance exactly once when the author formally resubmits.
+    # PDF uploads for revisions are saved under this upcoming round.
+    manuscript.review_round = get_current_review_round(db, manuscript) + 1
     manuscript.status = "revised"
 
     # Step 6: Save changes
     db.commit()
     db.refresh(manuscript)
 
-    return manuscript
+    return manuscript_to_response(manuscript)
 
 
 
@@ -580,29 +657,34 @@ def upload_manuscript(
             detail="You can only upload files to your own manuscripts"
         )
 
-    # Step 3: Check manuscript status
-    if manuscript.status not in ["submitted", "revision_required"]:
+    # Step 3: PDFs can be changed only before formal submission or while
+    # preparing a revision requested by the editor.
+    if manuscript.status not in ("draft", "revision_required"):
         raise HTTPException(
             status_code=409,
-            detail="Manuscript cannot be modified at this stage"
+            detail="PDF uploads are only allowed for drafts or manuscripts requiring revision"
         )
 
-    # Step 4: Prevent uploading after reviewer assignment
-    # Only check Round 1 for newly submitted manuscripts.
-    # Revision uploads are allowed after Round 1 is completed.
-    if manuscript.status == "submitted":
-        existing_assignment = db.scalar(
-            select(ReviewAssignment).where(
-                ReviewAssignment.manuscript_id == manuscript_id,
-                ReviewAssignment.review_round == 1
-            )
-        )
+    # Step 4: Prevent uploading after reviewer assignment in the target round.
+    # For a revision, upload the PDF for the *next* review round.
+    review_round = (
+        get_current_review_round(db, manuscript)
+        if manuscript.status == "draft"
+        else get_current_review_round(db, manuscript) + 1
+    )
 
-        if existing_assignment is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Cannot upload PDF after reviewer assignment"
-            )
+    existing_assignment = db.scalar(
+        select(ReviewAssignment).where(
+            ReviewAssignment.manuscript_id == manuscript_id,
+            ReviewAssignment.review_round == review_round
+        )
+    )
+
+    if existing_assignment is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot upload PDF after reviewer assignment"
+        )
 
     # Step 5: Validate PDF
     if file.content_type != "application/pdf":
@@ -627,23 +709,44 @@ def upload_manuscript(
             detail="Invalid PDF file"
         )
 
-    # Step 7: Create a directory for the manuscript
-    upload_dir = Path("uploads/manuscripts") / str(manuscript_id)
+    # Each upload gets a unique filename. Older files remain untouched.
+    # Existing legacy uploads/paper.pdf files are also preserved.
+    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 8: Save the PDF
-    file_path = upload_dir / "paper.pdf"
-    file_path.write_bytes(content)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    filename = f"round_{review_round}_{timestamp}_{uuid4().hex[:8]}.pdf"
+    file_path = upload_dir / filename
 
-    # Step 9: Save file path to database
-    manuscript.file_path = str(file_path)
+    # Write to a temporary file, then atomically publish the completed PDF.
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=upload_dir, suffix=".tmp", delete=False
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+        os.replace(temp_path, file_path)
+    except OSError:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Could not save PDF")
 
-    db.commit()
-    db.refresh(manuscript)
+    previous_path = manuscript.file_path
+    manuscript.file_path = str(file_path.relative_to(BASE_DIR))
+
+    try:
+        db.commit()
+        db.refresh(manuscript)
+    except Exception:
+        db.rollback()
+        manuscript.file_path = previous_path
+        file_path.unlink(missing_ok=True)
+        raise
 
     return {
         "manuscript_id": manuscript.manuscript_id,
-        "filename": "paper.pdf",
+        "filename": filename,
         "file_path": manuscript.file_path,
         "message": "PDF uploaded successfully"
     }
@@ -670,7 +773,7 @@ def download_manuscript(
 
     # Step 2: Check download permission
     is_author = manuscript.author_id == current_user.user_id
-    is_editor = current_user.role == "editor"
+    is_editor = current_user.role == "editor" and manuscript.status != "draft"
 
     # Check if the reviewer is assigned to this manuscript
     is_assigned_reviewer = False
@@ -699,7 +802,7 @@ def download_manuscript(
         )
 
     # Step 4: Check if the file exists
-    file_path = Path(manuscript.file_path)
+    file_path = resolve_manuscript_file_path(manuscript.file_path)
 
     if not file_path.is_file():
         raise HTTPException(
@@ -712,4 +815,69 @@ def download_manuscript(
         path=file_path,
         media_type="application/pdf",
         filename=f"manuscript_{manuscript_id}.pdf"
+    )
+
+
+
+# List all saved PDF uploads for a manuscript, including legacy paper.pdf.
+@router.get("/{manuscript_id}/versions", summary="List Manuscript PDF Versions")
+def list_manuscript_versions(
+    manuscript_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db)
+):
+    manuscript = db.get(Manuscript, manuscript_id)
+    if manuscript is None or not can_access_manuscript(db, manuscript, current_user):
+        raise HTTPException(status_code=404, detail="Manuscript not found")
+
+    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+    versions = []
+    if upload_dir.is_dir():
+        for path in upload_dir.glob("*.pdf"):
+            if not path.is_file():
+                continue
+            versions.append({
+                "filename": path.name,
+                "is_current": (
+                    manuscript.file_path is not None
+                    and resolve_manuscript_file_path(manuscript.file_path).resolve()
+                    == path.resolve()
+                ),
+                "size_bytes": path.stat().st_size
+            })
+
+    return sorted(versions, key=lambda item: item["filename"])
+
+
+@router.get(
+    "/{manuscript_id}/versions/{filename}",
+    summary="Download Historical Manuscript PDF"
+)
+def download_manuscript_version(
+    manuscript_id: int,
+    filename: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db)
+):
+    manuscript = db.get(Manuscript, manuscript_id)
+    if manuscript is None or not can_access_manuscript(db, manuscript, current_user):
+        raise HTTPException(status_code=404, detail="Manuscript not found")
+
+    # Only allow a single basename within this manuscript's upload folder.
+    if (
+        Path(filename).name != filename
+        or not filename.endswith(".pdf")
+        or filename in (".", "..")
+    ):
+        raise HTTPException(status_code=400, detail="Invalid PDF filename")
+
+    upload_dir = (BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)).resolve()
+    file_path = (upload_dir / filename).resolve()
+    if file_path.parent != upload_dir or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="PDF version not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=filename
     )

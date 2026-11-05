@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./ReviewerDashboard.css";
 
@@ -83,8 +82,10 @@ function ReviewerDashboard({ user, token, onLogout }) {
       }
 
       setAssignments(data);
+      setError("");
       return true;
     } catch (err) {
+      setAssignments([]);
       setError(err.message || "Failed to load assignments.");
       return false;
     } finally {
@@ -184,8 +185,13 @@ function ReviewerDashboard({ user, token, onLogout }) {
   };
 
   // Download assigned manuscript PDF
-  const handleDownload = async (manuscriptId) => {
+  const handleDownload = async (manuscriptId, hasPdf) => {
     if (downloadingId !== null) return;
+
+    if (!hasPdf) {
+      setError("No PDF has been uploaded for this manuscript.");
+      return;
+    }
 
     setDownloadingId(manuscriptId);
     setError("");
@@ -334,7 +340,8 @@ function ReviewerDashboard({ user, token, onLogout }) {
                   >
                     <div className="reviewer-card-top">
                       <h3>
-                        Manuscript #{assignment.manuscript_id}
+                        {assignment.manuscript_title ||
+                          `Manuscript #${assignment.manuscript_id}`}
                       </h3>
 
                       <span
@@ -343,6 +350,12 @@ function ReviewerDashboard({ user, token, onLogout }) {
                         {assignment.status}
                       </span>
                     </div>
+
+                    <p className="reviewer-meta">
+                      Manuscript #{assignment.manuscript_id}
+                      {" · "}
+                      Status: {assignment.manuscript_status || "Unknown"}
+                    </p>
 
                     <p className="reviewer-meta">
                       Assignment #{assignmentId}
@@ -357,18 +370,22 @@ function ReviewerDashboard({ user, token, onLogout }) {
                       ).toLocaleDateString()}
                     </p>
 
-                    <button
-                      type="button"
-                      className="reviewer-download"
-                      disabled={downloadingId !== null}
-                      onClick={() =>
-                        handleDownload(assignment.manuscript_id)
-                      }
-                    >
-                      {downloadingId === assignment.manuscript_id
-                        ? "Downloading..."
-                        : "Download Manuscript PDF"}
-                    </button>
+                    {assignment.has_pdf ? (
+                      <button
+                        type="button"
+                        className="reviewer-download"
+                        disabled={downloadingId !== null}
+                        onClick={() =>
+                          handleDownload(assignment.manuscript_id, assignment.has_pdf)
+                        }
+                      >
+                        {downloadingId === assignment.manuscript_id
+                          ? "Downloading..."
+                          : "Download Manuscript PDF"}
+                      </button>
+                    ) : (
+                      <p className="reviewer-meta">No PDF Uploaded</p>
+                    )}
 
                     {isAssigned && (
                       <div className="review-form">

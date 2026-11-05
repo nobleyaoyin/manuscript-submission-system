@@ -24,6 +24,13 @@ function AuthorDashboard({ user, token, onLogout }) {
   const [revisionFile, setRevisionFile] = useState(null);
   const [resubmitting, setResubmitting] = useState(false);
 
+  // Draft editing and final submission
+  const [draftEditingId, setDraftEditingId] = useState(null);
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftAbstract, setDraftAbstract] = useState("");
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [submittingDraftId, setSubmittingDraftId] = useState(null);
+
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -90,8 +97,11 @@ function AuthorDashboard({ user, token, onLogout }) {
       }
 
       setManuscripts(data);
+      return true;
     } catch (err) {
+      setManuscripts([]);
       setError(err.message || "Failed to load manuscripts.");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -129,7 +139,7 @@ function AuthorDashboard({ user, token, onLogout }) {
         }),
       });
 
-      await readResponse(response, "Manuscript submission failed");
+      await readResponse(response, "Failed to save draft");
 
       setTitle("");
       setAbstract("");
@@ -137,11 +147,90 @@ function AuthorDashboard({ user, token, onLogout }) {
 
       await loadManuscripts();
 
-      setMessage("Manuscript submitted successfully!");
+      setMessage("Draft saved successfully. Upload a PDF before submitting it.");
     } catch (err) {
-      setError(err.message || "Manuscript submission failed.");
+      setError(err.message || "Failed to save draft.");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // Edit a saved draft without submitting it
+  const startDraftEdit = (manuscript) => {
+    setDraftEditingId(manuscript.manuscript_id);
+    setDraftTitle(manuscript.title);
+    setDraftAbstract(manuscript.abstract);
+    setError("");
+    setMessage("");
+  };
+
+  const cancelDraftEdit = () => {
+    setDraftEditingId(null);
+    setDraftTitle("");
+    setDraftAbstract("");
+  };
+
+  const handleSaveDraft = async (event, manuscriptId) => {
+    event.preventDefault();
+    if (savingDraft) return;
+    if (!draftTitle.trim() || !draftAbstract.trim()) {
+      setError("Title and abstract cannot be empty.");
+      return;
+    }
+    setSavingDraft(true);
+    setError("");
+    setMessage("");
+    try {
+      const response = await fetch(`${API_URL}/manuscripts/${manuscriptId}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: draftTitle.trim(),
+          abstract: draftAbstract.trim(),
+        }),
+      });
+      await readResponse(response, "Failed to update draft");
+      cancelDraftEdit();
+      const refreshed = await loadManuscripts();
+      setMessage(refreshed
+        ? `Draft #${manuscriptId} updated successfully.`
+        : `Draft #${manuscriptId} updated, but the list could not be refreshed.`);
+    } catch (err) {
+      setError(err.message || "Failed to update draft.");
+    } finally {
+      setSavingDraft(false);
+    }
+  };
+
+  const handleSubmitDraft = async (manuscript) => {
+    const manuscriptId = manuscript.manuscript_id;
+    if (submittingDraftId !== null || uploadingId !== null || savingDraft) return;
+    if (!manuscript.has_pdf) {
+      setError("Upload a PDF before submitting this draft.");
+      return;
+    }
+    if (!window.confirm(`Submit Manuscript #${manuscriptId} for review? You will no longer be able to edit it as a draft.`)) return;
+    setSubmittingDraftId(manuscriptId);
+    setError("");
+    setMessage("");
+    try {
+      const response = await fetch(`${API_URL}/manuscripts/${manuscriptId}/submit`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await readResponse(response, "Failed to submit manuscript");
+      if (draftEditingId === manuscriptId) cancelDraftEdit();
+      const refreshed = await loadManuscripts();
+      setMessage(refreshed
+        ? `Manuscript #${manuscriptId} submitted successfully!`
+        : `Manuscript #${manuscriptId} submitted, but the list could not be refreshed.`);
+    } catch (err) {
+      setError(err.message || "Failed to submit manuscript.");
+    } finally {
+      setSubmittingDraftId(null);
     }
   };
 
@@ -188,7 +277,7 @@ function AuthorDashboard({ user, token, onLogout }) {
     return await readResponse(response, "PDF upload failed");
   };
 
-  // Upload PDF for submitted manuscript
+  // Upload PDF for draft manuscript
   const handleUpload = async (manuscriptId, file) => {
     if (!file || uploadingId !== null) return;
 
@@ -198,9 +287,11 @@ function AuthorDashboard({ user, token, onLogout }) {
 
     try {
       await uploadPDF(manuscriptId, file);
-
+      const refreshed = await loadManuscripts();
       setMessage(
-        `PDF uploaded successfully for Manuscript #${manuscriptId}.`
+        refreshed
+          ? `PDF uploaded successfully for Manuscript #${manuscriptId}.`
+          : `PDF uploaded for Manuscript #${manuscriptId}, but the manuscript list could not be refreshed.`
       );
     } catch (err) {
       setError(err.message || "PDF upload failed.");
@@ -237,6 +328,9 @@ function AuthorDashboard({ user, token, onLogout }) {
       }
 
       const blob = await response.blob();
+      if (blob.size === 0) {
+        throw new Error("Downloaded PDF is empty.");
+      }
       const url = URL.createObjectURL(blob);
 
       const link = document.createElement("a");
@@ -332,10 +426,11 @@ function AuthorDashboard({ user, token, onLogout }) {
 
       cancelRevision();
 
-      await loadManuscripts();
-
+      const refreshed = await loadManuscripts();
       setMessage(
-        `Manuscript #${manuscriptId} resubmitted successfully!`
+        refreshed
+          ? `Manuscript #${manuscriptId} resubmitted successfully!`
+          : `Manuscript #${manuscriptId} resubmitted, but the manuscript list could not be refreshed.`
       );
     } catch (err) {
       const prefix = pdfUploaded
@@ -351,6 +446,8 @@ function AuthorDashboard({ user, token, onLogout }) {
   };
 
   // Dashboard statistics
+  const draftCount = manuscripts.filter((manuscript) => manuscript.status === "draft").length;
+
   const acceptedCount = manuscripts.filter(
     (manuscript) => manuscript.status === "accepted"
   ).length;
@@ -394,6 +491,11 @@ function AuthorDashboard({ user, token, onLogout }) {
           </div>
 
           <div className="stat-card">
+            <span>Drafts</span>
+            <strong>{draftCount}</strong>
+          </div>
+
+          <div className="stat-card">
             <span>Accepted</span>
             <strong>{acceptedCount}</strong>
           </div>
@@ -431,7 +533,7 @@ function AuthorDashboard({ user, token, onLogout }) {
               disabled={submitting}
               onClick={() => setShowForm(!showForm)}
             >
-              {showForm ? "Cancel" : "+ New Submission"}
+              {showForm ? "Cancel" : "+ New Draft"}
             </button>
           </div>
 
@@ -440,7 +542,7 @@ function AuthorDashboard({ user, token, onLogout }) {
               className="submission-form"
               onSubmit={handleSubmit}
             >
-              <h3>Submit New Manuscript</h3>
+              <h3>Create New Draft</h3>
 
               <label htmlFor="manuscript-title">
                 Title
@@ -473,8 +575,8 @@ function AuthorDashboard({ user, token, onLogout }) {
 
               <button type="submit" disabled={submitting}>
                 {submitting
-                  ? "Submitting..."
-                  : "Submit Manuscript"}
+                  ? "Saving..."
+                  : "Save Draft"}
               </button>
             </form>
           )}
@@ -482,7 +584,7 @@ function AuthorDashboard({ user, token, onLogout }) {
           {loading ? (
             <p>Loading manuscripts...</p>
           ) : manuscripts.length === 0 ? (
-            <p>No manuscripts submitted yet.</p>
+            <p>No manuscripts or drafts yet.</p>
           ) : (
             <div className="manuscript-list">
               {manuscripts.map((manuscript) => {
@@ -490,6 +592,8 @@ function AuthorDashboard({ user, token, onLogout }) {
 
                 const needsRevision =
                   manuscript.status === "revision_required";
+                const isDraft = manuscript.status === "draft";
+                const isDraftEditing = draftEditingId === manuscriptId;
 
                 const isEditing = editingId === manuscriptId;
 
@@ -517,14 +621,18 @@ function AuthorDashboard({ user, token, onLogout }) {
                     </p>
 
                     <p className="manuscript-date">
-                      Submitted:{" "}
+                      Created:{" "}
                       {new Date(
                         manuscript.created_at
                       ).toLocaleDateString()}
                     </p>
 
+                    <p className="manuscript-date">
+                      PDF: {manuscript.has_pdf ? "PDF Available" : "No PDF Uploaded"}
+                    </p>
+
                     <div className="manuscript-actions">
-                      {manuscript.status === "submitted" && (
+                      {isDraft && (
                         <>
                           <input
                             type="file"
@@ -556,16 +664,42 @@ function AuthorDashboard({ user, token, onLogout }) {
                         </>
                       )}
 
-                      <button
-                        type="button"
-                        className="download-button"
-                        disabled={downloadingId !== null}
-                        onClick={() => handleDownload(manuscriptId)}
-                      >
-                        {downloadingId === manuscriptId
-                          ? "Downloading..."
-                          : "Download PDF"}
-                      </button>
+                      {manuscript.has_pdf && (
+                        <button
+                          type="button"
+                          className="download-button"
+                          disabled={downloadingId !== null}
+                          onClick={() => handleDownload(manuscriptId)}
+                        >
+                          {downloadingId === manuscriptId
+                            ? "Downloading..."
+                            : "Download PDF"}
+                        </button>
+                      )}
+
+                      {isDraft && (
+                        <>
+                          {!isDraftEditing && (
+                            <button
+                              type="button"
+                              className="upload-button"
+                              disabled={savingDraft || submittingDraftId !== null}
+                              onClick={() => startDraftEdit(manuscript)}
+                            >
+                              Edit Draft
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="upload-button"
+                            disabled={!manuscript.has_pdf || submittingDraftId !== null || uploadingId !== null || savingDraft}
+                            onClick={() => handleSubmitDraft(manuscript)}
+                            title={!manuscript.has_pdf ? "Upload a PDF before submitting" : "Submit for review"}
+                          >
+                            {submittingDraftId === manuscriptId ? "Submitting..." : "Submit Manuscript"}
+                          </button>
+                        </>
+                      )}
 
                       {needsRevision && !isEditing && (
                         <button
@@ -578,6 +712,42 @@ function AuthorDashboard({ user, token, onLogout }) {
                         </button>
                       )}
                     </div>
+
+                    {isDraft && isDraftEditing && (
+                      <form
+                        className="submission-form"
+                        onSubmit={(event) => handleSaveDraft(event, manuscriptId)}
+                      >
+                        <h3>Edit Draft #{manuscriptId}</h3>
+                        <label htmlFor={`draft-title-${manuscriptId}`}>Title</label>
+                        <input
+                          id={`draft-title-${manuscriptId}`}
+                          type="text"
+                          value={draftTitle}
+                          onChange={(event) => setDraftTitle(event.target.value)}
+                          maxLength={255}
+                          disabled={savingDraft}
+                          required
+                        />
+                        <label htmlFor={`draft-abstract-${manuscriptId}`}>Abstract</label>
+                        <textarea
+                          id={`draft-abstract-${manuscriptId}`}
+                          value={draftAbstract}
+                          onChange={(event) => setDraftAbstract(event.target.value)}
+                          rows={5}
+                          disabled={savingDraft}
+                          required
+                        />
+                        <div className="manuscript-actions">
+                          <button type="submit" className="upload-button" disabled={savingDraft}>
+                            {savingDraft ? "Saving..." : "Save Changes"}
+                          </button>
+                          <button type="button" className="download-button" onClick={cancelDraftEdit} disabled={savingDraft}>
+                            Cancel
+                          </button>
+                        </div>
+                      </form>
+                    )}
 
                     {needsRevision && isEditing && (
                       <form
