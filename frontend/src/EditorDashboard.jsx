@@ -1,6 +1,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./EditorDashboard.css";
+import NotificationBell from "./NotificationBell";
 
 const API_URL = "http://127.0.0.1:8000";
 
@@ -395,7 +396,22 @@ function EditorDashboard({ user, token, onLogout }) {
       setActionLoadingId(null);
     }
   };
+  const handleNotificationNavigate = (notification) => {
+    const manuscriptId = notification.manuscript_id;
 
+    const element = document.getElementById(
+      `manuscript-${manuscriptId}`
+    );
+
+    if (element) {
+      element.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+
+      setExpandedId(manuscriptId);
+    }
+  };
   return (
     <div className="editor-page">
       <header className="editor-header">
@@ -404,13 +420,28 @@ function EditorDashboard({ user, token, onLogout }) {
           <p>Editor Dashboard · {user.name}</p>
         </div>
 
-        <button
-          type="button"
-          className="editor-logout"
-          onClick={onLogout}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+          }}
         >
-          Logout
-        </button>
+          <NotificationBell
+             token={token}
+             onNavigate={handleNotificationNavigate}
+          />
+
+          <button
+            type="button"
+            className="editor-logout"
+            onClick={onLogout}
+          >
+            Logout
+          </button>
+        </div>
+
       </header>
 
       <main className="editor-main">
@@ -503,6 +534,7 @@ function EditorDashboard({ user, token, onLogout }) {
 
                     return (
                       <div
+                        id={`manuscript-${manuscriptId}`}
                         className="editor-card"
                         key={manuscriptId}
                       >

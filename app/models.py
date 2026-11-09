@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Boolean,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -156,4 +157,51 @@ class Review(Base):
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc)
+    )
+
+# Notification table
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    notification_id: Mapped[int] = mapped_column(
+        primary_key=True
+    )
+
+    # User who receives the notification
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.user_id"),
+        nullable=False,
+        index=True
+    )
+
+    # Related manuscript (optional)
+    manuscript_id: Mapped[int | None] = mapped_column(
+        ForeignKey("manuscripts.manuscript_id"),
+        nullable=True
+    )
+
+    # Notification category
+    notification_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False
+    )
+
+    # Notification content
+    message: Mapped[str] = mapped_column(
+        Text,
+        nullable=False
+    )
+
+    # Read / unread status
+    is_read: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False
+    )
+
+    # Creation timestamp
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
     )

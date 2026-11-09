@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./ReviewerDashboard.css";
+import NotificationBell from "./NotificationBell";
 
 const API_URL = "http://127.0.0.1:8000";
 
@@ -247,6 +248,33 @@ function ReviewerDashboard({ user, token, onLogout }) {
     (assignment) => assignment.status === "assigned"
   ).length;
 
+  const handleNotificationNavigate = (notification) => {
+    const manuscriptId = notification.manuscript_id;
+
+    const cards = Array.from(
+      document.querySelectorAll(".reviewer-card")
+    );
+
+    const matchingCards = cards.filter(
+      (card) =>
+        card.dataset.manuscriptId === String(manuscriptId)
+    );
+
+    // Prefer the latest review round
+    const target = matchingCards.sort(
+      (a, b) =>
+        Number(b.dataset.reviewRound) -
+        Number(a.dataset.reviewRound)
+    )[0];
+
+    if (target) {
+      target.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+  };
+
   return (
     <div className="reviewer-page">
       <header className="reviewer-header">
@@ -255,13 +283,28 @@ function ReviewerDashboard({ user, token, onLogout }) {
           <p>Reviewer Dashboard · {user.name}</p>
         </div>
 
-        <button
-          type="button"
-          onClick={onLogout}
-          className="reviewer-logout"
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+          }}
         >
-          Logout
-        </button>
+          <NotificationBell
+             token={token}
+             onNavigate={handleNotificationNavigate}
+          />
+
+          <button
+            type="button"
+            onClick={onLogout}
+            className="reviewer-logout"
+          >
+            Logout
+          </button>
+        </div>
+
       </header>
 
       <main className="reviewer-main">
@@ -333,11 +376,16 @@ function ReviewerDashboard({ user, token, onLogout }) {
                 const isSubmitting =
                   submittingId === assignmentId;
 
+
                 return (
                   <div
+                    id={`assignment-${assignmentId}`}
+                    data-manuscript-id={assignment.manuscript_id}
+                    data-review-round={assignment.review_round}
                     className="reviewer-card"
                     key={assignmentId}
                   >
+
                     <div className="reviewer-card-top">
                       <h3>
                         {assignment.manuscript_title ||

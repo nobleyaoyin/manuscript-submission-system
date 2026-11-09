@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User, Manuscript, ReviewAssignment, Review
+from app.models import User, Manuscript, ReviewAssignment, Review, Notification
 from app.schemas import ReviewAssignmentCreate, ReviewAssignmentResponse
 from app.routers.users import require_role
 from app.routers.manuscripts import manuscript_has_pdf
@@ -149,6 +149,7 @@ def assign_reviewer(
             detail="Reviewer already assigned in this review round"
         )
 
+
     # Step 6: Create the assignment
     new_assignment = ReviewAssignment(
         manuscript_id=assignment_data.manuscript_id,
@@ -159,10 +160,28 @@ def assign_reviewer(
     )
 
     db.add(new_assignment)
+
+    # Step 7: Notify the assigned reviewer
+    notification = Notification(
+        user_id=reviewer.user_id,
+        manuscript_id=manuscript.manuscript_id,
+        notification_type="review_assigned",
+        message=(
+            f"You have been assigned to review "
+            f"Manuscript #{manuscript.manuscript_id}: "
+            f"{manuscript.title} (Round {expected_round})."
+        ),
+        is_read=False
+    )
+
+    db.add(notification)
+
+    # Step 8: Save assignment and notification together
     db.commit()
     db.refresh(new_assignment)
 
     return assignment_to_response(new_assignment, manuscript)
+
 
 
 # Editor: View all review assignments

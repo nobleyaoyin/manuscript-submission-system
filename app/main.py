@@ -1,8 +1,19 @@
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import users, manuscripts, assignments, reviews
+from app.database import Base, engine
+from app import models
+from app.routers import users, manuscripts, assignments, reviews, notifications
+
+
+# Initialize database tables when the application starts
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
 
 
 # Create FastAPI application
@@ -12,7 +23,8 @@ app = FastAPI(
     version="0.1.0",
     swagger_ui_parameters={
         "persistAuthorization": True
-    }
+    },
+    lifespan=lifespan
 )
 
 
@@ -34,6 +46,7 @@ app.include_router(users.router)
 app.include_router(manuscripts.router)
 app.include_router(assignments.router)
 app.include_router(reviews.router)
+app.include_router(notifications.router)
 
 
 # Home endpoint

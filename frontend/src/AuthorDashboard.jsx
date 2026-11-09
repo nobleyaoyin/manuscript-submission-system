@@ -1,6 +1,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./AuthorDashboard.css";
+import NotificationBell from "./NotificationBell";
 
 const API_URL = "http://127.0.0.1:8000";
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -384,14 +385,19 @@ function AuthorDashboard({ user, token, onLogout }) {
     }
 
     // Validate before starting either API operation
+
     try {
-      if (revisionFile) {
-        validatePDF(revisionFile);
+      if (!revisionFile) {
+        setError("Please select a revised PDF before resubmitting.");
+        return;
       }
+
+      validatePDF(revisionFile);
     } catch (err) {
       setError(err.message);
       return;
     }
+
 
     setResubmitting(true);
     setError("");
@@ -401,10 +407,10 @@ function AuthorDashboard({ user, token, onLogout }) {
 
     try {
       // Upload replacement PDF before changing manuscript status
-      if (revisionFile) {
+
         await uploadPDF(manuscriptId, revisionFile);
         pdfUploaded = true;
-      }
+
 
       // Resubmit updated title and abstract
       const response = await fetch(
@@ -460,6 +466,21 @@ function AuthorDashboard({ user, token, onLogout }) {
     (manuscript) => manuscript.status === "revision_required"
   ).length;
 
+  const handleNotificationNavigate = (notification) => {
+    const manuscriptId = notification.manuscript_id;
+
+    const element = document.getElementById(
+      `manuscript-${manuscriptId}`
+    );
+
+    if (element) {
+      element.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+  };
+
   return (
     <div className="dashboard-page">
       <header className="dashboard-header">
@@ -468,13 +489,29 @@ function AuthorDashboard({ user, token, onLogout }) {
           <p>Author Dashboard · {user.name}</p>
         </div>
 
-        <button
-          type="button"
-          className="logout-button"
-          onClick={onLogout}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+          }}
         >
-          Logout
-        </button>
+          <NotificationBell
+            token={token}
+            onNavigate={handleNotificationNavigate}
+          />
+
+
+          <button
+            type="button"
+            className="logout-button"
+            onClick={onLogout}
+          >
+            Logout
+          </button>
+        </div>
+
       </header>
 
       <main className="dashboard-main">
@@ -597,11 +634,14 @@ function AuthorDashboard({ user, token, onLogout }) {
 
                 const isEditing = editingId === manuscriptId;
 
+
                 return (
                   <div
+                    id={`manuscript-${manuscriptId}`}
                     className="manuscript-card"
                     key={manuscriptId}
                   >
+
                     <div className="manuscript-card-top">
                       <h3>{manuscript.title}</h3>
 
@@ -798,7 +838,7 @@ function AuthorDashboard({ user, token, onLogout }) {
                         <label
                           htmlFor={`revision-pdf-${manuscriptId}`}
                         >
-                          Revised PDF (optional)
+                          Revised PDF (required)
                         </label>
 
                         <input
@@ -806,6 +846,7 @@ function AuthorDashboard({ user, token, onLogout }) {
                           type="file"
                           accept=".pdf,application/pdf"
                           ref={revisionFileInput}
+                          required
                           disabled={resubmitting}
                           onChange={(event) =>
                             setRevisionFile(

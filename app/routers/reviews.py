@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User, Manuscript, Review, ReviewAssignment
+from app.models import User, Manuscript, Review, ReviewAssignment, Notification
 from app.schemas import (
     ReviewCreate,
     ReviewResponse,
@@ -103,6 +103,7 @@ def submit_review(
             detail="This assignment is not available for review"
         )
 
+
     # Step 8: Create the review
     review = Review(
         assignment_id=assignment.assignment_id,
@@ -115,11 +116,27 @@ def submit_review(
     # Step 9: Mark assignment as completed
     assignment.status = "completed"
 
-    # Step 10: Save changes
+    # Step 10: Notify the editor who assigned the reviewer
+    notification = Notification(
+        user_id=assignment.assigned_by,
+        manuscript_id=manuscript.manuscript_id,
+        notification_type="review_submitted",
+        message=(
+            f"Reviewer {current_user.name} has submitted a review "
+            f"for Manuscript #{manuscript.manuscript_id}: "
+            f"{manuscript.title} (Round {current_round})."
+        ),
+        is_read=False
+    )
+
+    db.add(notification)
+
+    # Step 11: Save review, assignment status, and notification together
     db.commit()
     db.refresh(review)
 
     return review
+
 
 
 # Editor: View manuscript review history

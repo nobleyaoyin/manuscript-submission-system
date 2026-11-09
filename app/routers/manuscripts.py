@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.database import get_db, BASE_DIR
-from app.models import Manuscript, User, ReviewAssignment, Review
+from app.models import Manuscript, User, ReviewAssignment, Review, Notification
 from app.schemas import ManuscriptCreate, ManuscriptResponse, ManuscriptUpdate, EditorDecision
 from app.routers.users import get_current_user, require_role
 
@@ -73,6 +73,38 @@ def can_access_manuscript(db: Session, manuscript: Manuscript, user: User) -> bo
     )
     return assignment is not None
 
+def can_access_manuscript_pdf(
+    db: Session,
+    manuscript: Manuscript,
+    user: User,
+) -> bool:
+    """Check access to manuscript PDFs, including pending revisions."""
+
+    # Authors can access their own PDFs at any stage.
+    if manuscript.author_id == user.user_id:
+        return True
+
+    # A revision may contain a newly uploaded PDF that has not
+    # been formally resubmitted yet.
+    if manuscript.status in ("draft", "revision_required"):
+        return False
+
+    # Editors can access formally submitted manuscripts.
+    if user.role == "editor":
+        return True
+
+    # Reviewers must have an assignment for this manuscript.
+    if user.role != "reviewer":
+        return False
+
+    assignment = db.scalar(
+        select(ReviewAssignment.assignment_id).where(
+            ReviewAssignment.manuscript_id == manuscript.manuscript_id,
+            ReviewAssignment.reviewer_id == user.user_id,
+        ).limit(1)
+    )
+
+    return assignment is not None
 
 @router.post(
     "/",
@@ -555,14 +587,40 @@ def make_editor_decision(
                 detail="Not all assigned reviewers have submitted their reviews"
             )
 
-    # Step 2: Update manuscript status
+    # Step 4: Update manuscript status
     manuscript.status = decision_data.decision
 
-    # Step 3: Save to database
+    # Step 5: Create notification for the author
+    decision_messages = {
+        "accepted": "has been accepted",
+        "rejected": "has been rejected",
+        "revision_required": "requires revision",
+    }
+
+    decision_text = decision_messages.get(
+        decision_data.decision,
+        decision_data.decision
+    )
+
+    notification = Notification(
+        user_id=manuscript.author_id,
+        manuscript_id=manuscript.manuscript_id,
+        notification_type="editor_decision",
+        message=(
+            f"Your manuscript #{manuscript.manuscript_id}: "
+            f"{manuscript.title} {decision_text} "
+            f"(Round {current_round})."
+        ),
+        is_read=False
+    )
+
+    db.add(notification)
+
+    # Step 6: Save changes
     db.commit()
     db.refresh(manuscript)
 
-    # Step 4: Return the result
+    # Step 7: Return result
     return {
         "manuscript_id": manuscript.manuscript_id,
         "status": manuscript.status,
@@ -603,6 +661,28 @@ def resubmit_manuscript(
             detail="Manuscript does not require revision"
         )
 
+    # Require a new PDF for the upcoming review round.
+    next_round = get_current_review_round(db, manuscript) + 1
+
+    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+
+    current_pdf = (
+        resolve_manuscript_file_path(manuscript.file_path)
+        if manuscript.file_path
+        else None
+    )
+
+    if (
+        current_pdf is None
+        or not current_pdf.is_file()
+        or current_pdf.parent.resolve() != upload_dir.resolve()
+        or not current_pdf.name.startswith(f"round_{next_round}_")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload a revised PDF before resubmitting"
+        )
+
     # Step 4: Update manuscript fields
     changes = update_data.model_dump(exclude_unset=True)
 
@@ -623,7 +703,7 @@ def resubmit_manuscript(
 
     # Step 5: Advance exactly once when the author formally resubmits.
     # PDF uploads for revisions are saved under this upcoming round.
-    manuscript.review_round = get_current_review_round(db, manuscript) + 1
+    manuscript.review_round = next_round
     manuscript.status = "revised"
 
     # Step 6: Save changes
@@ -771,27 +851,11 @@ def download_manuscript(
             detail="Manuscript not found"
         )
 
-    # Step 2: Check download permission
-    is_author = manuscript.author_id == current_user.user_id
-    is_editor = current_user.role == "editor" and manuscript.status != "draft"
-
-    # Check if the reviewer is assigned to this manuscript
-    is_assigned_reviewer = False
-
-    if current_user.role == "reviewer":
-        assignment = db.scalar(
-            select(ReviewAssignment).where(
-                ReviewAssignment.manuscript_id == manuscript_id,
-                ReviewAssignment.reviewer_id == current_user.user_id
-            )
-        )
-
-        is_assigned_reviewer = assignment is not None
-
-    if not (is_author or is_editor or is_assigned_reviewer):
+    # Step 2: Check PDF download permission
+    if not can_access_manuscript_pdf(db, manuscript, current_user):
         raise HTTPException(
-            status_code=403,
-            detail="You do not have permission to download this manuscript"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to download this PDF",
         )
 
     # Step 3: Check if a PDF has been uploaded
@@ -827,8 +891,18 @@ def list_manuscript_versions(
     db: Session = Depends(get_db)
 ):
     manuscript = db.get(Manuscript, manuscript_id)
-    if manuscript is None or not can_access_manuscript(db, manuscript, current_user):
-        raise HTTPException(status_code=404, detail="Manuscript not found")
+
+    if manuscript is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Manuscript not found"
+        )
+
+    if not can_access_manuscript_pdf(db, manuscript, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to view PDF versions"
+        )
 
     upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
     versions = []
@@ -860,8 +934,18 @@ def download_manuscript_version(
     db: Session = Depends(get_db)
 ):
     manuscript = db.get(Manuscript, manuscript_id)
-    if manuscript is None or not can_access_manuscript(db, manuscript, current_user):
-        raise HTTPException(status_code=404, detail="Manuscript not found")
+
+    if manuscript is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Manuscript not found"
+        )
+
+    if not can_access_manuscript_pdf(db, manuscript, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to download this PDF version"
+        )
 
     # Only allow a single basename within this manuscript's upload folder.
     if (
