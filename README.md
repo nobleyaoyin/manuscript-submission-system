@@ -215,6 +215,70 @@ The API includes functionality for:
 
 Protected endpoints require appropriate authentication and role permissions.
 
+## Planned Publication Workflow
+
+The system is being developed toward a complete manuscript publication workflow, from initial submission to final publication.
+
+The planned workflow consists of three major phases and seven stages.
+
+### Phase 1: Initial Scan and Editing
+
+**1. Editor-in-Chief (EIC) Initial Scan**
+- The EIC reviews newly submitted manuscripts.
+- Authors may be asked to revise their manuscripts.
+- The EIC rescans revised submissions.
+- The EIC selects an initial editor and obtains the author's agreement.
+
+**2. Initial Editing**
+- The EIC invites an initial editor.
+- If the invitation is declined, another editor is selected.
+- The initial editor edits the manuscript.
+- The author reviews the edits.
+- The editor and EIC approve the edited manuscript.
+- The author confirms the pre-review version.
+
+### Phase 2: Peer Review and Decision
+
+**3. Reviewer Assignment and Peer Review**
+- The EIC invites two reviewers.
+- Reviewers who decline invitations are replaced.
+- Accepted reviewers submit their review reports.
+- Authors revise their manuscripts based on feedback.
+- The EIC checks revisions.
+- Reviewers recheck revised manuscripts when required.
+
+**4. Post-Review Decision**
+- The EIC determines whether further revisions are needed.
+- The review and revision cycle continues when necessary.
+- Manuscripts that complete this phase proceed to final editing.
+
+### Phase 3: Final Editing and Publication
+
+**5. Final Editing**
+- The EIC selects and invites a final editor.
+- An unavailable editor may be replaced.
+- The final editor prepares the manuscript.
+- The author reviews and approves the final edits.
+
+**6. Formatting**
+- The EIC assigns a formatter.
+- The formatter prepares the manuscript layout.
+- An unavailable formatter may be replaced.
+- The author reviews the formatting.
+- The EIC checks the author's formatting review.
+
+**7. DOI Assignment and Publication**
+- A DOI is assigned to the manuscript.
+- The publication process is completed.
+
+### Implementation Status
+
+The current system provides foundational manuscript submission, reviewer assignment, review, revision, editorial decision, and notification functionality.
+
+The complete EIC-led editorial workflow, invitation acceptance process, initial and final editing stages, formatting workflow, and DOI assignment are planned enhancements.
+
+These features will be implemented incrementally as development progresses.
+
 ## Development
 
 This project is under active development.
