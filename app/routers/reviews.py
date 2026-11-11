@@ -1,12 +1,17 @@
 
 from typing import Annotated
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
 from app.database import get_db
-from app.models import User, Manuscript, Review, ReviewAssignment, Notification
+from app.models import (
+    User,
+    Manuscript,
+    Review,
+    ReviewAssignment,
+    Notification,
+    InitialEditorInvitation,
+)
 from app.schemas import (
     ReviewCreate,
     ReviewResponse,
@@ -68,11 +73,12 @@ def submit_review(
         )
 
     # Step 4: Check manuscript status
-    if manuscript.status not in ("submitted", "revised"):
+    if manuscript.status not in ("ready_for_peer_review", "revised"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Manuscript is not open for review"
+            detail="Manuscript is not open for peer review",
         )
+
 
     # Step 5: Use the manuscript's current review round
     current_round = manuscript.review_round
@@ -160,6 +166,28 @@ def get_manuscript_reviews(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Manuscript not found"
+        )
+
+    # Only an editor assigned to this manuscript can view its reviews.
+    accepted_invitation = db.scalar(
+        select(InitialEditorInvitation).where(
+            InitialEditorInvitation.manuscript_id == manuscript_id,
+            InitialEditorInvitation.editor_id == current_user.user_id,
+            InitialEditorInvitation.status == "accepted",
+        )
+    )
+
+    assigned_reviewer = db.scalar(
+        select(ReviewAssignment.assignment_id).where(
+            ReviewAssignment.manuscript_id == manuscript_id,
+            ReviewAssignment.assigned_by == current_user.user_id,
+        )
+    )
+
+    if accepted_invitation is None and assigned_reviewer is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not an assigned editor for this manuscript",
         )
 
     # Step 2: Get all reviews and their assignments

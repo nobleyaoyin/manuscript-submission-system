@@ -175,3 +175,126 @@ class EditorDecision(BaseModel):
 class ReviewHistoryResponse(ReviewResponse):
     review_round: int
     reviewer_id: int
+
+# Schema for EIC initial manuscript screening
+class EICInitialScanCreate(BaseModel):
+    decision: Literal[
+        "pass",
+        "revision_required",
+        "reject",
+    ]
+
+    comments: str = Field(
+        min_length=1,
+        max_length=5000,
+    )
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty.")
+
+        return value
+
+# Schema for inviting an initial editor
+class InitialEditorInviteCreate(BaseModel):
+    manuscript_id: int = Field(gt=0)
+    editor_id: int = Field(gt=0)
+
+
+# Schema for responding to an initial editor invitation
+class InitialEditorInvitationDecision(BaseModel):
+    decision: Literal["accept", "decline"]
+
+
+# Schema for returning initial editor invitation information
+class InitialEditorInvitationResponse(BaseModel):
+    invitation_id: int
+    manuscript_id: int
+    editor_id: int
+    invited_by: int
+    status: str
+    invited_at: datetime
+    responded_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+class InitialEditingAuthorReview(BaseModel):
+    decision: Literal["approve", "request_revision"]
+    comments: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty.")
+
+        return value
+
+class InitialEditingEditorApproval(BaseModel):
+    decision: Literal["approve", "request_revision"]
+    comments: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty.")
+
+        return value
+
+class InitialEditingEICApproval(BaseModel):
+    decision: Literal["approve", "request_revision"]
+    comments: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty.")
+
+        return value
+
+class PreReviewConfirmationRequest(BaseModel):
+    decision: Literal["confirm", "request_revision"]
+    comments: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty.")
+
+        return value
+
+class EICDecisionCreate(BaseModel):
+    decision: Literal[
+        "accept",
+        "reject",
+        "revision_required",
+    ]
+    comments: str = Field(
+        min_length=1,
+        max_length=5000,
+    )
+
+    @field_validator("comments")
+    @classmethod
+    def validate_comments(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Comments cannot be empty")
+
+        return value

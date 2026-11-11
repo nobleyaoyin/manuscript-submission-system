@@ -1,4 +1,3 @@
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import Base, engine
 from app import models
-from app.routers import users, manuscripts, assignments, reviews, notifications
+from app.routers import users, manuscripts, assignments, reviews, notifications, eic
 
 
 # Initialize database tables when the application starts
@@ -47,6 +46,7 @@ app.include_router(manuscripts.router)
 app.include_router(assignments.router)
 app.include_router(reviews.router)
 app.include_router(notifications.router)
+app.include_router(eic.router)
 
 
 # Home endpoint
