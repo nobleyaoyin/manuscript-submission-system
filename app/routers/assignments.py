@@ -1,12 +1,20 @@
-
+from pathlib import Path
+from fastapi.responses import FileResponse
 from typing import Annotated
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
 from app.database import get_db
-from app.models import User, Manuscript, ReviewAssignment, Review, Notification
+from app.models import (
+    User,
+    Manuscript,
+    ReviewAssignment,
+    Review,
+    Notification,
+    PreReviewConfirmation,
+    InitialEditingSubmission,
+    InitialEditorInvitation,
+)
 from app.schemas import ReviewAssignmentCreate, ReviewAssignmentResponse
 from app.routers.users import require_role
 from app.routers.manuscripts import manuscript_has_pdf
@@ -16,7 +24,7 @@ router = APIRouter(
     prefix="/assignments",
     tags=["Review Assignments"]
 )
-
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 def assignment_to_response(
     assignment: ReviewAssignment,
@@ -100,11 +108,60 @@ def assign_reviewer(
             detail="Manuscript not found"
         )
 
-    # Step 2: Validate manuscript status
-    if manuscript.status not in ("submitted", "revised"):
+
+    # Step 2: Validate manuscript workflow status.
+    if manuscript.status not in ("ready_for_peer_review", "revised"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Manuscript is not available for reviewer assignment"
+            detail="Manuscript is not ready for reviewer assignment",
+        )
+
+    # Step 2.1: Verify author confirmation for the first review round.
+    if manuscript.review_round == 1:
+        confirmation = db.scalar(
+            select(PreReviewConfirmation)
+            .join(
+                InitialEditingSubmission,
+                PreReviewConfirmation.submission_id
+                == InitialEditingSubmission.submission_id,
+            )
+            .where(
+                PreReviewConfirmation.manuscript_id
+                == manuscript.manuscript_id,
+                PreReviewConfirmation.author_id
+                == manuscript.author_id,
+                PreReviewConfirmation.decision == "confirm",
+                InitialEditingSubmission.status == "eic_approved",
+                InitialEditingSubmission.manuscript_id
+                == manuscript.manuscript_id,
+            )
+            .order_by(
+                PreReviewConfirmation.confirmation_id.desc()
+            )
+        )
+
+        if confirmation is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Author pre-review confirmation is required",
+            )
+
+    # Step 2.2: Verify that the current editor is assigned
+    # to this manuscript.
+    accepted_invitation = db.scalar(
+        select(InitialEditorInvitation).where(
+            InitialEditorInvitation.manuscript_id
+            == manuscript.manuscript_id,
+            InitialEditorInvitation.editor_id
+            == current_user.user_id,
+            InitialEditorInvitation.status == "accepted",
+        )
+    )
+
+    if accepted_invitation is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not the assigned editor for this manuscript",
         )
 
     # Step 3: Use the manuscript's current review round
@@ -343,3 +400,113 @@ def get_manuscript_review_summary(
             and pending_reviews == 0
         )
     }
+
+@router.get(
+    "/{assignment_id}/download",
+    summary="Download Assigned Peer-review PDF",
+)
+def download_assigned_review_pdf(
+    assignment_id: int,
+    current_user: Annotated[
+        User,
+        Depends(require_role("reviewer")),
+    ],
+    db: Session = Depends(get_db),
+):
+    # Step 1: Find the review assignment.
+    assignment = db.get(ReviewAssignment, assignment_id)
+
+    if assignment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Review assignment not found",
+        )
+
+    # Step 2: Only the assigned reviewer can download.
+    if assignment.reviewer_id != current_user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not assigned to this review",
+        )
+
+    manuscript = db.get(Manuscript, assignment.manuscript_id)
+
+    if manuscript is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Manuscript not found",
+        )
+
+    # Step 3: Find the confirmed pre-review PDF.
+    confirmation = db.scalar(
+        select(PreReviewConfirmation)
+        .join(
+            InitialEditingSubmission,
+            PreReviewConfirmation.submission_id
+            == InitialEditingSubmission.submission_id,
+        )
+        .where(
+            PreReviewConfirmation.manuscript_id
+            == manuscript.manuscript_id,
+            PreReviewConfirmation.decision == "confirm",
+            InitialEditingSubmission.status == "eic_approved",
+            InitialEditingSubmission.manuscript_id
+            == manuscript.manuscript_id,
+        )
+        .order_by(
+            PreReviewConfirmation.confirmation_id.desc()
+        )
+    )
+
+    if confirmation is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No confirmed pre-review PDF is available",
+        )
+
+    # Step 4: Ensure the confirmed file matches the approved version.
+    submission = db.get(
+        InitialEditingSubmission,
+        confirmation.submission_id,
+    )
+
+    if confirmation.file_path != submission.file_path:
+        raise HTTPException(
+            status_code=409,
+            detail="Confirmed PDF does not match the approved version",
+        )
+
+    # Step 5: Resolve and validate the PDF path.
+    upload_root = (
+        BASE_DIR / "uploads" / "initial_editing"
+    ).resolve()
+
+    pdf_path = (
+        BASE_DIR / confirmation.file_path
+    ).resolve()
+
+    if (
+        not pdf_path.is_relative_to(upload_root)
+        or not pdf_path.is_file()
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="Confirmed PDF file not found",
+        )
+
+    with pdf_path.open("rb") as pdf:
+        if pdf.read(5) != b"%PDF-":
+            raise HTTPException(
+                status_code=409,
+                detail="Confirmed file is not a valid PDF",
+            )
+
+    # Step 6: Return the confirmed PDF.
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=(
+            f"manuscript_{manuscript.manuscript_id}"
+            f"_review_round_{assignment.review_round}.pdf"
+        ),
+    )

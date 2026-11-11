@@ -11,7 +11,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.database import get_db, BASE_DIR
-from app.models import Manuscript, User, ReviewAssignment, Review, Notification
+from app.models import (
+    Manuscript,
+    User,
+    ReviewAssignment,
+    Review,
+    Notification,
+    InitialEditorInvitation,
+)
 from app.schemas import ManuscriptCreate, ManuscriptResponse, ManuscriptUpdate, EditorDecision
 from app.routers.users import get_current_user, require_role
 
@@ -56,55 +63,117 @@ def get_current_review_round(db: Session, manuscript: Manuscript) -> int:
     return latest_round or 1
 
 
-def can_access_manuscript(db: Session, manuscript: Manuscript, user: User) -> bool:
+
+def can_access_manuscript(
+    db: Session,
+    manuscript: Manuscript,
+    user: User,
+) -> bool:
+    # Authors can access their own manuscripts.
     if manuscript.author_id == user.user_id:
         return True
+
+    # Drafts are private to their authors.
     if manuscript.status == "draft":
         return False
-    if user.role == "editor":
+
+    # EIC can access submitted manuscripts.
+    if user.role == "eic":
         return True
-    if user.role != "reviewer":
-        return False
-    assignment = db.scalar(
-        select(ReviewAssignment.assignment_id).where(
-            ReviewAssignment.manuscript_id == manuscript.manuscript_id,
-            ReviewAssignment.reviewer_id == user.user_id
-        ).limit(1)
-    )
-    return assignment is not None
+
+    # Editors need an accepted initial editor invitation,
+    # or an existing peer-review assignment made by them.
+    if user.role == "editor":
+        invitation = db.scalar(
+            select(InitialEditorInvitation.invitation_id)
+            .where(
+                InitialEditorInvitation.manuscript_id
+                == manuscript.manuscript_id,
+                InitialEditorInvitation.editor_id == user.user_id,
+                InitialEditorInvitation.status == "accepted",
+            )
+            .limit(1)
+        )
+
+        if invitation is not None:
+            return True
+
+        assignment = db.scalar(
+            select(ReviewAssignment.assignment_id)
+            .where(
+                ReviewAssignment.manuscript_id
+                == manuscript.manuscript_id,
+                ReviewAssignment.assigned_by == user.user_id,
+            )
+            .limit(1)
+        )
+
+        return assignment is not None
+
+    # Reviewers need an assignment.
+    if user.role == "reviewer":
+        assignment = db.scalar(
+            select(ReviewAssignment.assignment_id)
+            .where(
+                ReviewAssignment.manuscript_id
+                == manuscript.manuscript_id,
+                ReviewAssignment.reviewer_id == user.user_id,
+            )
+            .limit(1)
+        )
+
+        return assignment is not None
+
+    return False
+
+
 
 def can_access_manuscript_pdf(
     db: Session,
     manuscript: Manuscript,
     user: User,
 ) -> bool:
-    """Check access to manuscript PDFs, including pending revisions."""
-
-    # Authors can access their own PDFs at any stage.
+    # Authors can always access their own PDFs.
     if manuscript.author_id == user.user_id:
         return True
 
-    # A revision may contain a newly uploaded PDF that has not
-    # been formally resubmitted yet.
-    if manuscript.status in ("draft", "revision_required"):
+    # Unsubmitted PDFs remain private to the author.
+    if manuscript.status in (
+        "draft",
+        "revision_required",
+        "initial_revision_required",
+    ):
         return False
 
-    # Editors can access formally submitted manuscripts.
-    if user.role == "editor":
-        return True
+    return can_access_manuscript(db, manuscript, user)
 
-    # Reviewers must have an assignment for this manuscript.
-    if user.role != "reviewer":
-        return False
+def get_accessible_manuscripts(
+    db: Session,
+    user: User,
+) -> list[Manuscript]:
+    """
+    Return non-draft manuscripts accessible to an EIC or Editor.
+    """
 
-    assignment = db.scalar(
-        select(ReviewAssignment.assignment_id).where(
-            ReviewAssignment.manuscript_id == manuscript.manuscript_id,
-            ReviewAssignment.reviewer_id == user.user_id,
-        ).limit(1)
-    )
+    if user.role not in ("eic", "editor"):
+        return []
 
-    return assignment is not None
+    manuscripts = db.scalars(
+        select(Manuscript)
+        .where(Manuscript.status != "draft")
+        .order_by(Manuscript.manuscript_id)
+    ).all()
+
+    # EIC can access all submitted manuscripts.
+    if user.role == "eic":
+        return list(manuscripts)
+
+    # Editors can only access manuscripts they are authorized for.
+    return [
+        manuscript
+        for manuscript in manuscripts
+        if can_access_manuscript(db, manuscript, user)
+    ]
 
 @router.post(
     "/",
@@ -165,60 +234,83 @@ def submit_draft_manuscript(
 @router.get(
     "/",
     response_model=list[ManuscriptResponse],
-    summary="Get All Manuscripts"
+    summary="Get Accessible Manuscripts",
 )
 def get_all_manuscripts(
     status: str | None = None,
-    current_user: User = Depends(require_role("editor")),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(require_role("editor", "eic")),
+    db: Session = Depends(get_db),
 ):
-    # Start with all manuscripts
-    query = select(Manuscript).where(Manuscript.status != "draft")
+    # Get only manuscripts the current user can access.
+    manuscripts = get_accessible_manuscripts(
+        db,
+        current_user,
+    )
 
-    # Filter by status if provided
+    # Apply optional status filtering.
     if status is not None:
-        query = query.where(Manuscript.status == status)
+        manuscripts = [
+            manuscript
+            for manuscript in manuscripts
+            if manuscript.status == status
+        ]
 
-    # Sort by manuscript ID
-    query = query.order_by(Manuscript.manuscript_id)
-
-    manuscripts = db.scalars(query).all()
-
-    return [manuscript_to_response(item) for item in manuscripts]
+    return [
+        manuscript_to_response(manuscript)
+        for manuscript in manuscripts
+    ]
 
 
 # Editor: Dashboard statistics by manuscript status
 # Keep this static route before /{manuscript_id}.
-@router.get("/statistics", summary="Get Manuscript Statistics")
-def get_manuscript_statistics(
-    current_user: User = Depends(require_role("editor")),
-    db: Session = Depends(get_db)
-):
-    statuses = (
-        "submitted", "accepted", "rejected",
-        "revision_required", "revised"
-    )
-    counts = {name: 0 for name in statuses}
 
-    # Count submitted manuscripts; drafts are private to their authors.
-    manuscripts = db.scalars(select(Manuscript).where(Manuscript.status != "draft")).all()
+@router.get(
+    "/statistics",
+    summary="Get Manuscript Statistics",
+)
+def get_manuscript_statistics(
+    current_user: User = Depends(require_role("editor", "eic")),
+    db: Session = Depends(get_db),
+):
+    # Get only manuscripts accessible to the current user.
+    manuscripts = get_accessible_manuscripts(
+        db,
+        current_user,
+    )
+
+    # Count manuscripts by workflow status.
+    counts = {
+        "submitted": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "revision_required": 0,
+        "revised": 0,
+        "initial_scan_passed": 0,
+        "initial_revision_required": 0,
+        "initial_rejected": 0,
+        "initial_editor_invited": 0,
+        "initial_editing": 0,
+    }
+
     for manuscript in manuscripts:
         if manuscript.status in counts:
             counts[manuscript.status] += 1
 
-    return {"total": len(manuscripts), **counts}
-
-
+    return {
+        "total": len(manuscripts),
+        **counts,
+    }
 
 @router.get("/dashboard", summary="Get Editor Dashboard")
 def get_editor_dashboard(
-    current_user: User = Depends(require_role("editor")),
+    current_user: User = Depends(require_role("editor", "eic")),
     db: Session = Depends(get_db)
 ):
-    # Step 1: Get all manuscripts
-    manuscripts = db.scalars(
-        select(Manuscript).where(Manuscript.status != "draft").order_by(Manuscript.manuscript_id)
-    ).all()
+    # Step 1: Get only accessible manuscripts
+    manuscripts = get_accessible_manuscripts(
+        db,
+        current_user,
+    )
 
     dashboard = []
 
@@ -290,10 +382,13 @@ def get_editor_dashboard(
     summary="Get Editor Dashboard Summary"
 )
 def get_editor_dashboard_summary(
-    current_user: User = Depends(require_role("editor")),
+    current_user: User = Depends(require_role("editor", "eic")),
     db: Session = Depends(get_db)
 ):
-    manuscripts = db.scalars(select(Manuscript).where(Manuscript.status != "draft")).all()
+    manuscripts = get_accessible_manuscripts(
+        db,
+        current_user,
+    )
 
     summary = {
         "total_manuscripts": len(manuscripts),
@@ -361,53 +456,33 @@ def get_my_manuscripts(
 
     return [manuscript_to_response(item) for item in manuscripts]
 
-
-
 @router.get(
     "/{manuscript_id}",
-    response_model=ManuscriptResponse
+    response_model=ManuscriptResponse,
+    summary="Get Manuscript Details",
 )
 def get_manuscript(
     manuscript_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    # Find the manuscript by its ID
     manuscript = db.get(Manuscript, manuscript_id)
 
     if manuscript is None:
         raise HTTPException(
             status_code=404,
-            detail="Manuscript not found"
+            detail="Manuscript not found",
         )
 
-    # Check whether the user is the author
-    is_author = manuscript.author_id == current_user.user_id
-
-    # Check whether the user is an editor
-    is_editor = current_user.role == "editor" and manuscript.status != "draft"
-
-    # Check whether the reviewer is assigned to this manuscript
-    is_assigned_reviewer = False
-
-    if current_user.role == "reviewer":
-        assignment = db.scalar(
-            select(ReviewAssignment).where(
-                ReviewAssignment.manuscript_id == manuscript_id,
-                ReviewAssignment.reviewer_id == current_user.user_id
-            )
-        )
-
-        is_assigned_reviewer = assignment is not None
-
-    # Allow only authorized users
-    if not (is_author or is_editor or is_assigned_reviewer):
+    # Use the centralized manuscript access rules.
+    if not can_access_manuscript(db, manuscript, current_user):
         raise HTTPException(
             status_code=404,
-            detail="Manuscript not found"
+            detail="Manuscript not found",
         )
 
     return manuscript_to_response(manuscript)
+
 
 
 
@@ -739,7 +814,11 @@ def upload_manuscript(
 
     # Step 3: PDFs can be changed only before formal submission or while
     # preparing a revision requested by the editor.
-    if manuscript.status not in ("draft", "revision_required"):
+    if manuscript.status not in (
+            "draft",
+            "revision_required",
+            "initial_revision_required",
+    ):
         raise HTTPException(
             status_code=409,
             detail="PDF uploads are only allowed for drafts or manuscripts requiring revision"
@@ -748,9 +827,9 @@ def upload_manuscript(
     # Step 4: Prevent uploading after reviewer assignment in the target round.
     # For a revision, upload the PDF for the *next* review round.
     review_round = (
-        get_current_review_round(db, manuscript)
-        if manuscript.status == "draft"
-        else get_current_review_round(db, manuscript) + 1
+        get_current_review_round(db, manuscript) + 1
+        if manuscript.status == "revision_required"
+        else get_current_review_round(db, manuscript)
     )
 
     existing_assignment = db.scalar(
@@ -965,3 +1044,145 @@ def download_manuscript_version(
         media_type="application/pdf",
         filename=filename
     )
+
+@router.post(
+    "/{manuscript_id}/initial-resubmit",
+    response_model=ManuscriptResponse,
+    summary="Resubmit Manuscript for EIC Initial Scan",
+)
+def initial_resubmit_manuscript(
+    manuscript_id: int,
+    update_data: ManuscriptUpdate,
+    current_user: User = Depends(require_role("author")),
+    db: Session = Depends(get_db),
+):
+    # Find the manuscript.
+    manuscript = db.get(Manuscript, manuscript_id)
+
+    if manuscript is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Manuscript not found",
+        )
+
+    # Only the original author can resubmit.
+    if manuscript.author_id != current_user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only resubmit your own manuscript",
+        )
+
+    # Only manuscripts awaiting initial revision are eligible.
+    if manuscript.status != "initial_revision_required":
+        raise HTTPException(
+            status_code=409,
+            detail="Manuscript does not require initial revision",
+        )
+
+    # Initial revision must happen before peer review.
+    existing_assignment = db.scalar(
+        select(ReviewAssignment.assignment_id)
+        .where(ReviewAssignment.manuscript_id == manuscript_id)
+        .limit(1)
+    )
+
+    if existing_assignment is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Peer review has already started",
+        )
+
+    # Verify that the author uploaded a new PDF after the
+    # most recent EIC initial scan.
+    from app.models import EICInitialScan
+
+    latest_scan = db.scalar(
+        select(EICInitialScan)
+        .where(EICInitialScan.manuscript_id == manuscript_id)
+        .order_by(
+            EICInitialScan.created_at.desc(),
+            EICInitialScan.scan_id.desc(),
+        )
+        .limit(1)
+    )
+
+    if latest_scan is None or latest_scan.decision != "revision_required":
+        raise HTTPException(
+            status_code=409,
+            detail="No pending EIC revision request",
+        )
+
+    if not manuscript_has_pdf(manuscript):
+        raise HTTPException(
+            status_code=409,
+            detail="Upload a revised PDF before resubmitting",
+        )
+
+    current_pdf = resolve_manuscript_file_path(manuscript.file_path)
+
+    # Uploaded PDFs use UTC timestamps in their filenames.
+    # The PDF must belong to this manuscript and be newer
+    # than the latest EIC revision request.
+    upload_dir = (
+        BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+    ).resolve()
+
+    if current_pdf.parent.resolve() != upload_dir:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload a revised PDF before resubmitting",
+        )
+
+    try:
+        timestamp_text = current_pdf.name.split("_")[2]
+        upload_time = datetime.strptime(
+            timestamp_text,
+            "%Y%m%dT%H%M%S%fZ",
+        ).replace(tzinfo=timezone.utc)
+
+        scan_time = latest_scan.created_at
+
+        if scan_time.tzinfo is None:
+            scan_time = scan_time.replace(tzinfo=timezone.utc)
+
+        if upload_time <= scan_time:
+            raise ValueError("PDF predates the EIC revision request")
+
+    except (ValueError, IndexError):
+        raise HTTPException(
+            status_code=409,
+            detail="Upload a new revised PDF before resubmitting",
+        )
+
+    # Update optional manuscript metadata.
+    changes = update_data.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        if value is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field} cannot be null",
+            )
+
+        setattr(manuscript, field, value)
+
+    # Return to EIC screening without advancing review_round.
+    manuscript.status = "submitted"
+
+    # Notify the EIC who requested the revision.
+    db.add(
+        Notification(
+            user_id=latest_scan.eic_id,
+            manuscript_id=manuscript_id,
+            notification_type="initial_resubmission",
+            message=(
+                f"Manuscript #{manuscript_id} has been "
+                "resubmitted for EIC initial screening."
+            ),
+        )
+    )
+
+    db.commit()
+    db.refresh(manuscript)
+
+    return manuscript_to_response(manuscript)
