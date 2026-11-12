@@ -1,306 +1,77 @@
-# Manuscript Submission System
+# G-Sub Manuscript Submission System
 
-A web-based manuscript submission and peer-review management system built with **FastAPI** and **React**.
+G-Sub is a working name for a classroom manuscript submission and journal workflow project. The backend uses **FastAPI, SQLAlchemy, and SQLite**; the frontend uses **React and Vite**. Authentication uses JWTs and server-side role checks.
 
-The system supports the manuscript submission and review process through role-based access control, allowing authors, editors, and reviewers to manage their respective tasks.
+## Current functionality
 
-## Features
+The application has Author, Editor, Editor-in-Chief (EIC), Reviewer, and Formatter backend roles and dashboards. Authors can create drafts, upload, submit, revise, and track manuscripts. The workflow includes EIC screening, initial editing, reviewer invitations and round-specific files, review decisions, a post-acceptance author agreement, final editing, formatting reviews, and a **local publication prototype**. In-app notifications are available.
 
-### Author
-- Register and log in to the system.
-- Create and manage manuscript submissions.
-- Upload manuscript PDF files.
-- View manuscript status and editorial decisions.
-- Submit revised manuscripts.
-- Access manuscript version history.
-- Receive notifications about manuscript updates.
+Author manuscript uploads currently accept PDF, DOCX, and DOC up to 10 MiB. TXT is not yet supported. Initial-editing, final-editing and formatting uploads currently require PDF. A reviewer receives the file bound to their assignment's review round. Existing historical assignments without reliable bindings can show “File Unavailable”.
 
-### Editor
-- View and manage submitted manuscripts.
-- Assign reviewers to manuscripts.
-- Track reviewer assignments and review progress.
-- Review submitted feedback.
-- Make editorial decisions: **Accept, Reject, or Request Revision**.
-- Manage multiple rounds of manuscript review.
-- Receive notifications about review activity.
+The agreement text is a placeholder; local publication does not publish externally and the DOI status is pending external registration. AI screening, configurable reviewer anonymity, universal four-format uploads, real DOI registration and some workflow improvements remain planned. Email verification has a restricted development integration; workflow email enqueueing is disabled by default. Do not assume a feature is deployment-ready merely because its code exists. See the [remaining-work audit](reports/step_128_27_22_remaining_work_audit.md) and [demo roadmap](reports/step_128_27_22_demo_roadmap.md).
 
-### Reviewer
-- View assigned manuscripts.
-- Access manuscript files for review.
-- Submit review feedback and recommendations.
-- Track completed and pending assignments.
-- Receive notifications about new assignments.
+## Prerequisites and dependencies
 
-### Additional Features
-- JWT-based authentication.
-- Role-based authorization for authors, editors, and reviewers.
-- PDF file upload and download.
-- Manuscript revision and version tracking.
-- Multiple review rounds.
-- In-app notification system.
-- RESTful API with interactive Swagger documentation.
-
-## Tech Stack
-
-| Component | Technology |
-|---|---|
-| Backend | Python, FastAPI |
-| Frontend | React, JavaScript, Vite |
-| Database | SQLite |
-| ORM | SQLAlchemy |
-| Authentication | JWT |
-| API Documentation | Swagger UI |
-| Version Control | Git, GitHub |
-
-## Project Structure
-
-```text
-manuscript-submission-system/
-├── app/
-│   ├── main.py
-│   ├── models.py
-│   └── routers/
-│       ├── users.py
-│       ├── manuscripts.py
-│       ├── assignments.py
-│       ├── reviews.py
-│       └── notifications.py
-├── frontend/
-│   ├── src/
-│   │   ├── AuthorDashboard.jsx
-│   │   ├── EditorDashboard.jsx
-│   │   ├── ReviewerDashboard.jsx
-│   │   ├── NotificationBell.jsx
-│   │   └── NotificationBell.css
-│   └── package.json
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
-*The structure above highlights the main components rather than every file in the repository.*
-
-## Installation
-
-### Prerequisites
-
-Make sure the following are installed:
-
-- Python 3.10 or later
-- Node.js and npm
-- Git
-
-### 1. Clone the Repository
+Use Python 3.12 and a Node.js version supported by the current Vite dependencies (Node 20.19+, 22.12+, or 24+). Git and npm are required. From a new checkout:
 
 ```bash
 git clone https://github.com/nobleyaoyin/manuscript-submission-system.git
 cd manuscript-submission-system
-```
-
-**Note:** This is a private repository. GitHub access is required.
-
-### 2. Backend Setup
-
-Create a Python virtual environment:
-
-```bash
-python3 -m venv .venv
-```
-
-Activate the environment:
-
-**macOS / Linux**
-
-```bash
+python3.12 -m venv .venv
 source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-**Windows**
-
-```bash
-.venv\Scripts\activate
-```
-
-Install the Python dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Start the FastAPI server:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-The backend will be available at:
-
-http://127.0.0.1:8000
-
-Interactive API documentation:
-
-http://127.0.0.1:8000/docs
-
-### 3. Frontend Setup
-
-Open another terminal and navigate to the frontend directory:
+The pinned requirements, including the startup import `resend`, were installed and checked in a fresh Python 3.12 environment on macOS using PyPI. Python 3.9 was unable to resolve the `annotated-types==0.8.0` pin; ensure that `python3.12` really invokes Python 3.12. Other platforms and package indexes have not been verified, and the pinned `uvloop` dependency may limit Windows installation. No provider credentials are needed for the isolated Demo.
 
 ```bash
 cd frontend
+npm ci
+npm run build
+cd ..
 ```
 
-Install dependencies:
+## First-time local data setup
+
+**Start with the fresh isolated Demo** described in [docs/DEMO.md](docs/DEMO.md). It creates a new synthetic SQLite database, uploads and five demo-only accounts in a separately selected new directory; the initializer refuses an existing directory. The initializer applies migrations 001–006 to its new database. Do not rerun it to restore a previous demo.
+
+There is currently **no documented, verified command to initialize an empty ordinary Development database**. Development mode expects a pre-existing `manuscript.db` at the project root with the base schema and migrations 001–006; the email-verification features have additional schema requirements. Application startup checks migrations and does not initialize or migrate an existing database. Do not copy a teammate's private database or use `create_all()` to repair one. Any initialization or migration procedure for an existing database requires an independently verified backup, isolated rehearsal, and explicit owner approval. Until a supported fresh Development initializer is documented, use the isolated Demo for first-time exploration.
+
+## Start the application
+
+For the isolated Demo, follow [docs/DEMO.md](docs/DEMO.md). Its gateway serves the built frontend and FastAPI under one localhost origin.
+
+For ordinary Development **only after a compatible local database has been safely prepared**, set a private signing key in your shell and start the backend:
 
 ```bash
-npm install
+export SECRET_KEY='<your-own-private-random-signing-key>'
+.venv/bin/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Start the development server:
+Replace the placeholder with a strong randomly generated secret; never commit or share it. An optional private `.env` may be used locally. Never use the Demo key for Development. On Windows, use the equivalent virtual-environment executable and environment-variable command.
+
+In a second terminal, start Vite from the repository root:
 
 ```bash
+cd frontend
 npm run dev
 ```
 
-Open the local URL displayed in the terminal, typically:
+Vite normally serves `http://localhost:5173` and proxies `/api` to the backend at `127.0.0.1:8000`. Development API documentation is at `http://127.0.0.1:8000/docs`; Demo mode disables public registration and API documentation. Do not start a public tunnel or deploy without explicit approval.
 
-http://localhost:5173
+## Isolated tests
 
-**Note:** Both the backend and frontend servers must be running for the application to function properly. Any required environment configuration must also be set up locally.
+The following backend suites use temporary SQLite databases and temporary upload directories. Run from the project root with a synthetic signing key; they do not require provider access:
 
-## User Roles and Workflow
+```bash
+PYTHON_DOTENV_DISABLED=1 SECRET_KEY=synthetic-test-only PYTHONPATH=tests \
+  .venv/bin/python -B -m unittest tests.test_initial_editing tests.test_reviewer_invitations tests.test_two_reviewer_policy -q
+PYTHON_DOTENV_DISABLED=1 SECRET_KEY=synthetic-test-only PYTHONPATH=tests \
+  .venv/bin/python -B -m unittest tests.test_author_agreement tests.test_final_workflow tests.test_formatting tests.test_reviewer_download -q
+```
 
-The system supports three primary user roles.
+These commands use a synthetic test-only value, not an application credential. Browser tests additionally require Playwright and a compatible browser; do not point them at existing environments. Do not run the root `test_manuscript.py` against valuable data: it can write to the configured database. Inspect unfamiliar test fixtures before running broad test discovery.
 
-**1. Author**
+## Data and repository safety
 
-The author creates a manuscript submission and uploads a PDF file.
-
-**2. Editor**
-
-The editor reviews the submission and assigns one or more reviewers.
-
-**3. Reviewer**
-
-Assigned reviewers evaluate the manuscript and submit their feedback.
-
-**4. Editorial Decision**
-
-The editor reviews the feedback and makes a decision:
-
-- **Accept:** The manuscript is accepted.
-- **Reject:** The manuscript is rejected.
-- **Request Revision:** The author is asked to revise the manuscript.
-
-**5. Revision and Additional Review**
-
-When revisions are requested, the author can submit an updated manuscript. The system supports additional review rounds and maintains manuscript version history.
-
-## API Documentation
-
-FastAPI automatically generates interactive API documentation using Swagger UI.
-
-After starting the backend, visit:
-
-http://127.0.0.1:8000/docs
-
-The API includes functionality for:
-
-- User registration and authentication
-- Manuscript submission and management
-- Reviewer assignments
-- Review submission
-- Editorial decisions
-- Manuscript revisions
-- Notifications
-
-Protected endpoints require appropriate authentication and role permissions.
-
-## Planned Publication Workflow
-
-The system is being developed toward a complete manuscript publication workflow, from initial submission to final publication.
-
-The planned workflow consists of three major phases and seven stages.
-
-### Phase 1: Initial Scan and Editing
-
-**1. Editor-in-Chief (EIC) Initial Scan**
-- The EIC reviews newly submitted manuscripts.
-- Authors may be asked to revise their manuscripts.
-- The EIC rescans revised submissions.
-- The EIC selects an initial editor and obtains the author's agreement.
-
-**2. Initial Editing**
-- The EIC invites an initial editor.
-- If the invitation is declined, another editor is selected.
-- The initial editor edits the manuscript.
-- The author reviews the edits.
-- The editor and EIC approve the edited manuscript.
-- The author confirms the pre-review version.
-
-### Phase 2: Peer Review and Decision
-
-**3. Reviewer Assignment and Peer Review**
-- The EIC invites two reviewers.
-- Reviewers who decline invitations are replaced.
-- Accepted reviewers submit their review reports.
-- Authors revise their manuscripts based on feedback.
-- The EIC checks revisions.
-- Reviewers recheck revised manuscripts when required.
-
-**4. Post-Review Decision**
-- The EIC determines whether further revisions are needed.
-- The review and revision cycle continues when necessary.
-- Manuscripts that complete this phase proceed to final editing.
-
-### Phase 3: Final Editing and Publication
-
-**5. Final Editing**
-- The EIC selects and invites a final editor.
-- An unavailable editor may be replaced.
-- The final editor prepares the manuscript.
-- The author reviews and approves the final edits.
-
-**6. Formatting**
-- The EIC assigns a formatter.
-- The formatter prepares the manuscript layout.
-- An unavailable formatter may be replaced.
-- The author reviews the formatting.
-- The EIC checks the author's formatting review.
-
-**7. DOI Assignment and Publication**
-- A DOI is assigned to the manuscript.
-- The publication process is completed.
-
-### Implementation Status
-
-The current system provides foundational manuscript submission, reviewer assignment, review, revision, editorial decision, and notification functionality.
-
-The complete EIC-led editorial workflow, invitation acceptance process, initial and final editing stages, formatting workflow, and DOI assignment are planned enhancements.
-
-These features will be implemented incrementally as development progresses.
-
-## Development
-
-This project is under active development.
-
-Current work focuses on improving the manuscript submission workflow, reviewer assignment management, editorial decision handling, and user notifications.
-
-Future improvements may include additional editorial workflow features, enhanced user interfaces, and further testing.
-
-## Security and Local Data
-
-Local environment files, databases, uploaded manuscripts, and dependency directories are excluded from version control through `.gitignore`.
-
-Developers should use their own local configuration and test data. Sensitive credentials and private manuscript files should not be committed to the repository.
-
-## Project Information
-
-**Project:** Manuscript Submission System
-
-**Backend:** FastAPI
-
-**Frontend:** React
-
-**Database:** SQLite
-
-**Repository:** https://github.com/nobleyaoyin/manuscript-submission-system
+Keep environment files, signing keys, database files and sidecars, uploads, generated Demo credentials, backups, virtual environments and `node_modules` out of Git. Never reset, overwrite, migrate or restore another person's database or uploads without explicit permission. Do not send real email or connect to external services merely to run the local Demo. The planned work is tracked in the [demo roadmap](reports/step_128_27_22_demo_roadmap.md); the [baseline report](reports/step_128_27_23_workflow_baseline.md) distinguishes API coverage from browser coverage.

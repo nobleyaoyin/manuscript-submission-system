@@ -1,0 +1,10 @@
+.initial-editing-panel { background: #fff; border: 1px solid #dbe2ec; border-radius: 10px; padding: 1rem; margin: 1rem 0; color: #233047; }
+.initial-editing-heading { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.initial-editing-item { border-top: 1px solid #dbe2ec; padding: .8rem 0; }
+.initial-editing-submission { border-left: 3px solid #afc3dc; padding: .1rem .8rem .6rem; margin: .8rem 0; }
+.initial-editing-form { background: #f3f6fb; padding: 1rem; margin-top: .8rem; }
+.initial-editing-form label { display: block; margin: .6rem 0; }
+.initial-editing-form textarea, .initial-editing-form select, .initial-editing-form input { display: block; width: 100%; margin-top: .3rem; padding: .4rem; }
+.initial-editing-form textarea { min-height: 5rem; }
+.initial-editing-panel button { padding: .5rem .7rem; cursor: pointer; }
+.initial-editing-buttons { display: flex; gap: .5rem; }

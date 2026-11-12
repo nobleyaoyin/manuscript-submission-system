@@ -18,6 +18,7 @@ from app.schemas import (
     ReviewHistoryResponse
 )
 from app.routers.users import require_role
+from app.reviewer_invitations import may_review
 
 
 router = APIRouter(
@@ -59,6 +60,9 @@ def submit_review(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only review your assigned manuscripts"
         )
+
+    if not may_review(db, assignment):
+        raise HTTPException(status_code=403, detail="Accept the review invitation before submitting a review")
 
     # Step 3: Find the manuscript
     manuscript = db.get(

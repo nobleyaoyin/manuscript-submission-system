@@ -1,8 +1,14 @@
-from pathlib import Path
+from app.config import DATA_ROOT
 from fastapi.responses import FileResponse
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
+import logging
+import sqlite3
+from datetime import datetime, timezone
+from pydantic import BaseModel
+from typing import Literal
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import (
@@ -14,29 +20,71 @@ from app.models import (
     PreReviewConfirmation,
     InitialEditingSubmission,
     InitialEditorInvitation,
+    ReviewRoundFile,
+    ReviewAssignmentFile,
+    ReviewerInvitation,
 )
 from app.schemas import ReviewAssignmentCreate, ReviewAssignmentResponse
 from app.routers.users import require_role
-from app.routers.manuscripts import manuscript_has_pdf
+from app.routers.manuscripts import manuscript_has_pdf, ALLOWED_MANUSCRIPT_EXTENSIONS, can_access_manuscript
+from app.review_files import get_or_create_round_one, resolve_assignment_file, validate_round_file
+from app.reviewer_invitations import invitation_status, not_declined
+from app.review_progress import review_progress
+from app.email.enqueue_mode import EnqueueMode, OutboxSchemaUnavailable, check_outbox_schema, reviewer_email_enqueue_mode
+from app.email.outbox import enqueue_reviewer_invitation
 
 
 router = APIRouter(
     prefix="/assignments",
     tags=["Review Assignments"]
 )
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = DATA_ROOT
+logger = logging.getLogger(__name__)
+
+
+def _sqlite_busy(error):
+    original = getattr(error, 'orig', error)
+    code = getattr(original, 'sqlite_errorcode', None)
+    return code is not None and (code & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _rollback_or_unknown(db):
+    try:
+        db.rollback()
+        return True
+    except Exception:
+        logger.error('reviewer_invitation_rollback_unknown')
+        return False
+
+
+_UNKNOWN = 'Invitation outcome could not be confirmed; refresh the reviewer assignment list before trying again.'
+
+
+class _EnqueueFailure(Exception):
+    def __init__(self, error):
+        self.error = error
 
 def assignment_to_response(
+    db: Session,
     assignment: ReviewAssignment,
     manuscript: Manuscript
 ) -> ReviewAssignmentResponse:
     """Include manuscript information without changing database tables."""
     response = ReviewAssignmentResponse.model_validate(assignment)
 
+    try:
+        resolve_assignment_file(db, assignment, manuscript)
+        available = True
+    except HTTPException:
+        available = False
+
     return response.model_copy(update={
+        "invitation_status": invitation_status(db, assignment),
         "manuscript_title": manuscript.title,
         "manuscript_status": manuscript.status,
         "has_pdf": manuscript_has_pdf(manuscript),
+        "review_file_available": available,
+        "review_file_status": "available" if available else "unavailable",
     })
 
 
@@ -76,7 +124,7 @@ def assignments_to_responses(
             )
 
         result.append(
-            assignment_to_response(assignment, manuscript)
+            assignment_to_response(db, assignment, manuscript)
         )
 
     return result
@@ -92,10 +140,26 @@ def assign_reviewer(
     assignment_data: ReviewAssignmentCreate,
     current_user: Annotated[
         User,
-        Depends(require_role("editor"))
+        Depends(require_role("editor", "eic"))
     ],
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    enqueue_mode: EnqueueMode = Depends(reviewer_email_enqueue_mode),
 ):
+    if not isinstance(enqueue_mode, EnqueueMode):
+        raise HTTPException(status_code=503, detail='Reviewer invitation is temporarily unavailable.')
+    if enqueue_mode is EnqueueMode.DISABLED:
+        return _assign_reviewer(assignment_data, current_user, db, enqueue_mode)
+    try:
+        return _assign_reviewer(assignment_data, current_user, db, enqueue_mode)
+    except SQLAlchemyError as error:
+        if not _sqlite_busy(error):
+            raise
+        if not _rollback_or_unknown(db):
+            raise HTTPException(status_code=503, detail=_UNKNOWN) from None
+        raise HTTPException(status_code=503, detail='Reviewer invitation was not saved due to temporary database contention. Refresh the reviewer assignment list before retrying.') from None
+
+
+def _assign_reviewer(assignment_data, current_user, db, enqueue_mode):
     # Step 1: Find the manuscript
     manuscript = db.get(
         Manuscript,
@@ -158,7 +222,7 @@ def assign_reviewer(
         )
     )
 
-    if accepted_invitation is None:
+    if current_user.role == "editor" and accepted_invitation is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not the assigned editor for this manuscript",
@@ -207,37 +271,128 @@ def assign_reviewer(
         )
 
 
-    # Step 6: Create the assignment
-    new_assignment = ReviewAssignment(
-        manuscript_id=assignment_data.manuscript_id,
-        reviewer_id=assignment_data.reviewer_id,
-        assigned_by=current_user.user_id,
-        review_round=expected_round,
-        status="assigned"
-    )
+    # The preflight is only reached by an explicitly overridden test dependency.
+    # It precedes get_or_create_round_one, which can itself write and flush.
+    if enqueue_mode is EnqueueMode.ENQUEUE_ONLY:
+        try:
+            check_outbox_schema(db)
+        except (OutboxSchemaUnavailable, SQLAlchemyError, ImportError, OSError, AttributeError) as error:
+            logger.error('reviewer_invitation_preflight_unavailable')
+            if not _rollback_or_unknown(db):
+                raise HTTPException(status_code=503, detail=_UNKNOWN) from None
+            if _sqlite_busy(error):
+                raise HTTPException(status_code=503, detail='Reviewer invitation is temporarily unavailable due to database contention. Refresh the reviewer assignment list before retrying.') from None
+            raise HTTPException(status_code=503, detail='Reviewer invitation is unavailable because the notification queue is not ready.') from None
 
-    db.add(new_assignment)
+    def build_invitation():
+        # Bind the assignment to the formally authorized file for this round.
+        if expected_round == 1:
+            round_file = get_or_create_round_one(db, manuscript)
+        else:
+            round_file = db.scalar(select(ReviewRoundFile).where(
+                ReviewRoundFile.manuscript_id == manuscript.manuscript_id,
+                ReviewRoundFile.review_round == expected_round,
+            ))
+            if round_file is None:
+                raise HTTPException(status_code=409, detail="No recorded file for this review round; contact the editorial team")
+            validate_round_file(round_file, manuscript, db)
 
-    # Step 7: Notify the assigned reviewer
-    notification = Notification(
-        user_id=reviewer.user_id,
-        manuscript_id=manuscript.manuscript_id,
-        notification_type="review_assigned",
-        message=(
-            f"You have been assigned to review "
-            f"Manuscript #{manuscript.manuscript_id}: "
-            f"{manuscript.title} (Round {expected_round})."
-        ),
-        is_read=False
-    )
+        # Step 6: Create the assignment
+        new_assignment = ReviewAssignment(
+            manuscript_id=assignment_data.manuscript_id,
+            reviewer_id=assignment_data.reviewer_id,
+            assigned_by=current_user.user_id,
+            review_round=expected_round,
+            status="assigned"
+        )
 
-    db.add(notification)
+        db.add(new_assignment)
+        db.flush()
+        db.add(ReviewAssignmentFile(assignment_id=new_assignment.assignment_id, round_file_id=round_file.round_file_id))
+        db.add(ReviewerInvitation(assignment_id=new_assignment.assignment_id, status="pending"))
 
-    # Step 8: Save assignment and notification together
+        # Step 7: Notify the assigned reviewer
+        notification = Notification(
+            user_id=reviewer.user_id,
+            manuscript_id=manuscript.manuscript_id,
+            notification_type="review_invitation",
+            message=(
+                f"You have been invited to review "
+                f"Manuscript #{manuscript.manuscript_id}: "
+                f"{manuscript.title} (Round {expected_round})."
+            ),
+            is_read=False
+        )
+
+        db.add(notification)
+
+        return new_assignment
+
+    if enqueue_mode is EnqueueMode.DISABLED:
+        new_assignment = build_invitation()
+        db.commit()
+        db.refresh(new_assignment)
+        return assignment_to_response(db, new_assignment, manuscript)
+
+    try:
+        new_assignment = build_invitation()
+        try:
+            enqueue_reviewer_invitation(db, new_assignment.assignment_id)
+        except Exception as error:
+            # Log only a category, not SQL, exception text or manuscript data.
+            logger.error('reviewer_invitation_enqueue_failed: %s', type(error).__name__)
+            raise _EnqueueFailure(error) from None
+    except HTTPException:
+        if not _rollback_or_unknown(db):
+            raise HTTPException(status_code=503, detail=_UNKNOWN) from None
+        raise
+    except Exception as error:
+        if not _rollback_or_unknown(db):
+            raise HTTPException(status_code=503, detail=_UNKNOWN) from None
+        cause = error.error if isinstance(error, _EnqueueFailure) else error
+        if _sqlite_busy(cause):
+            raise HTTPException(status_code=503, detail='Reviewer invitation was not saved due to temporary database contention. Refresh the reviewer assignment list before retrying.') from None
+        if isinstance(error, _EnqueueFailure):
+            raise HTTPException(status_code=503, detail='Reviewer invitation was not saved because notification queueing failed.') from None
+        if isinstance(error, SQLAlchemyError):
+            logger.error('reviewer_invitation_database_failure')
+            raise HTTPException(status_code=503, detail='Reviewer invitation was not saved due to a database error.') from None
+        raise
+
+    try:
+        db.commit()
+        db.refresh(new_assignment)
+        return assignment_to_response(db, new_assignment, manuscript)
+    except Exception:
+        # A commit acknowledgement, refresh or serialization error may occur
+        # after commit. Never claim that the invitation was not saved.
+        logger.error('reviewer_invitation_commit_or_refresh_unknown')
+        _rollback_or_unknown(db)
+        raise HTTPException(status_code=503, detail=_UNKNOWN) from None
+
+
+
+class InvitationResponse(BaseModel):
+    decision: Literal["accept", "decline"]
+
+
+@router.post("/{assignment_id}/invitation-response")
+def respond_reviewer_invitation(assignment_id: int, data: InvitationResponse, current_user: User = Depends(require_role("reviewer")), db: Session = Depends(get_db)):
+    assignment = db.get(ReviewAssignment, assignment_id)
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if assignment.reviewer_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="This invitation belongs to another reviewer")
+    manuscript = db.get(Manuscript, assignment.manuscript_id)
+    if manuscript is None or manuscript.status not in ("ready_for_peer_review", "revised") or manuscript.review_round != assignment.review_round:
+        raise HTTPException(status_code=409, detail="This review round is no longer open")
+    new_status = "accepted" if data.decision == "accept" else "declined"
+    result = db.execute(update(ReviewerInvitation).where(ReviewerInvitation.assignment_id == assignment_id, ReviewerInvitation.status == "pending").values(status=new_status, responded_at=datetime.now(timezone.utc)))
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="Invitation is not pending")
+    db.add(Notification(user_id=assignment.assigned_by, manuscript_id=assignment.manuscript_id, notification_type="review_invitation_response", message=f"Reviewer {current_user.name} {new_status} the invitation for manuscript #{assignment.manuscript_id}, round {assignment.review_round}.", is_read=False))
     db.commit()
-    db.refresh(new_assignment)
-
-    return assignment_to_response(new_assignment, manuscript)
+    return {"assignment_id": assignment_id, "invitation_status": new_status}
 
 
 
@@ -260,7 +415,12 @@ def get_all_assignments(
         )
     ).all()
 
-    return assignments_to_responses(db, assignments)
+    accessible = []
+    for assignment in assignments:
+        manuscript = db.get(Manuscript, assignment.manuscript_id)
+        if manuscript and can_access_manuscript(db, manuscript, current_user):
+            accessible.append(assignment)
+    return assignments_to_responses(db, accessible)
 
 
 # Reviewer: View their own assignments
@@ -299,7 +459,7 @@ def get_manuscript_review_progress(
     manuscript_id: int,
     current_user: Annotated[
         User,
-        Depends(require_role("editor"))
+        Depends(require_role("editor", "eic"))
     ],
     db: Session = Depends(get_db)
 ):
@@ -310,6 +470,9 @@ def get_manuscript_review_progress(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Manuscript not found"
         )
+
+    if not can_access_manuscript(db, manuscript, current_user):
+        raise HTTPException(status_code=403, detail="You are not an assigned editor")
 
     assignments = db.scalars(
         select(ReviewAssignment)
@@ -323,7 +486,7 @@ def get_manuscript_review_progress(
     ).all()
 
     return [
-        assignment_to_response(assignment, manuscript)
+        assignment_to_response(db, assignment, manuscript)
         for assignment in assignments
     ]
 
@@ -337,7 +500,7 @@ def get_manuscript_review_summary(
     manuscript_id: int,
     current_user: Annotated[
         User,
-        Depends(require_role("editor"))
+        Depends(require_role("editor", "eic"))
     ],
     db: Session = Depends(get_db)
 ):
@@ -350,6 +513,9 @@ def get_manuscript_review_summary(
             detail="Manuscript not found"
         )
 
+    if not can_access_manuscript(db, manuscript, current_user):
+        raise HTTPException(status_code=403, detail="You are not an assigned editor")
+
     # Step 2: Use current review round
     review_round = manuscript.review_round
 
@@ -357,7 +523,8 @@ def get_manuscript_review_summary(
     assignments = db.scalars(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == manuscript_id,
-            ReviewAssignment.review_round == review_round
+            ReviewAssignment.review_round == review_round,
+            not_declined(),
         )
     ).all()
 
@@ -391,6 +558,7 @@ def get_manuscript_review_summary(
     # Step 6: Return summary
     return {
         "manuscript_id": manuscript_id,
+        "decision_progress": review_progress(db, manuscript, review_round),
         "review_round": review_round,
         "total_reviewers": total_reviewers,
         "completed_reviews": completed_reviews,
@@ -437,76 +605,10 @@ def download_assigned_review_pdf(
             detail="Manuscript not found",
         )
 
-    # Step 3: Find the confirmed pre-review PDF.
-    confirmation = db.scalar(
-        select(PreReviewConfirmation)
-        .join(
-            InitialEditingSubmission,
-            PreReviewConfirmation.submission_id
-            == InitialEditingSubmission.submission_id,
-        )
-        .where(
-            PreReviewConfirmation.manuscript_id
-            == manuscript.manuscript_id,
-            PreReviewConfirmation.decision == "confirm",
-            InitialEditingSubmission.status == "eic_approved",
-            InitialEditingSubmission.manuscript_id
-            == manuscript.manuscript_id,
-        )
-        .order_by(
-            PreReviewConfirmation.confirmation_id.desc()
-        )
-    )
-
-    if confirmation is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No confirmed pre-review PDF is available",
-        )
-
-    # Step 4: Ensure the confirmed file matches the approved version.
-    submission = db.get(
-        InitialEditingSubmission,
-        confirmation.submission_id,
-    )
-
-    if confirmation.file_path != submission.file_path:
-        raise HTTPException(
-            status_code=409,
-            detail="Confirmed PDF does not match the approved version",
-        )
-
-    # Step 5: Resolve and validate the PDF path.
-    upload_root = (
-        BASE_DIR / "uploads" / "initial_editing"
-    ).resolve()
-
-    pdf_path = (
-        BASE_DIR / confirmation.file_path
-    ).resolve()
-
-    if (
-        not pdf_path.is_relative_to(upload_root)
-        or not pdf_path.is_file()
-    ):
-        raise HTTPException(
-            status_code=404,
-            detail="Confirmed PDF file not found",
-        )
-
-    with pdf_path.open("rb") as pdf:
-        if pdf.read(5) != b"%PDF-":
-            raise HTTPException(
-                status_code=409,
-                detail="Confirmed file is not a valid PDF",
-            )
-
-    # Step 6: Return the confirmed PDF.
+    path = resolve_assignment_file(db, assignment, manuscript)
+    extension = path.suffix.lower()
     return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
-        filename=(
-            f"manuscript_{manuscript.manuscript_id}"
-            f"_review_round_{assignment.review_round}.pdf"
-        ),
+        path=path,
+        media_type=ALLOWED_MANUSCRIPT_EXTENSIONS[extension],
+        filename=f"manuscript_{manuscript.manuscript_id}_review_round_{assignment.review_round}{extension}",
     )
