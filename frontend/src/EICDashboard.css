@@ -1,0 +1,15 @@
+.eic-page { max-width: 1400px; margin: auto; padding: 1.5rem; color: #233047; }
+.eic-page header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.eic-page header > div:last-child { display: flex; align-items: center; gap: 1rem; }
+.eic-grid { display: grid; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); gap: 1.5rem; }
+.eic-grid section, .eic-grid main { background: white; border: 1px solid #dbe2ec; border-radius: 8px; padding: 1rem; }
+.eic-page label { display: block; margin: .7rem 0; }
+.eic-page input, .eic-page select, .eic-page textarea { display: block; width: 100%; padding: .5rem; margin-top: .3rem; }
+.eic-page textarea { min-height: 5rem; }
+.eic-page button { cursor: pointer; padding: .5rem .8rem; }
+.eic-list { list-style: none; padding: 0; }
+.eic-list button { text-align: left; width: 100%; margin-bottom: .4rem; }
+.eic-list button[aria-pressed=true] { background: #dbeafe; }
+.eic-page form { padding: 1rem; background: #f3f6fb; margin-bottom: 1rem; }
+.eic-error { color: #a51515; }
+@media (max-width: 700px) { .eic-grid { grid-template-columns: 1fr; } }

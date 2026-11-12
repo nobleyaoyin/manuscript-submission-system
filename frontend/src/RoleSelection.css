@@ -1,0 +1,31 @@
+.role-page { min-height: 100vh; background: #0a1525; color: #e5edf8; padding: 9vh 24px 48px; }
+.role-shell { max-width: 760px; margin: 0 auto; }
+.role-heading { text-align: center; margin-bottom: 70px; }
+.role-heading h1 { font: 400 clamp(52px, 7vw, 70px)/1 Georgia, serif; color: #f5f7fb; letter-spacing: -3px; margin: 0 0 16px; }
+.role-heading h1 span, .auth-brand span { color: #e7be45; }
+.role-heading p { color: #a5b1c1; font-size: 11px; letter-spacing: .24em; text-transform: uppercase; margin: 0; line-height: 1.6; }
+.role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.role-card { min-height: 205px; display: flex; flex-direction: column; align-items: flex-start; text-align: left; padding: 30px 28px; border: 1px solid #344253; border-radius: 16px; background: #172536; cursor: pointer; transition: border-color .16s, transform .16s, background .16s; }
+.role-card:hover { background: #1d2d40; border-color: var(--role-accent); transform: translateY(-2px); }
+.role-card:focus-visible, .role-secondary button:focus-visible, .change-role:focus-visible { outline: 3px solid #f5d66e; outline-offset: 4px; }
+.role-eic { --role-accent: #e9c95b; --role-icon-bg: #3a382e; }
+.role-editor { --role-accent: #80b6ff; --role-icon-bg: #203a5b; }
+.role-reviewer { --role-accent: #c2a7ff; --role-icon-bg: #312d51; }
+.role-author { --role-accent: #78d7b1; --role-icon-bg: #173d3a; }
+.role-icon { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 12px; color: var(--role-accent); background: var(--role-icon-bg); font-size: 29px; line-height: 1; }
+.role-name { margin-top: 20px; color: var(--role-accent); text-transform: uppercase; font-size: 11px; letter-spacing: .16em; font-weight: 700; }
+.role-description { margin-top: 10px; color: #c0cad8; font-size: 14px; line-height: 1.65; }
+.role-secondary { text-align: center; margin: 30px 0 0; color: #b5c1d0; font-size: 14px; }
+.role-secondary p { display: inline; margin-right: 8px; }
+.role-secondary button { border: 0; padding: 6px; color: #a8caff; background: transparent; cursor: pointer; text-decoration: underline; }
+.role-note { color: #a5b1c1; text-align: center; font-size: 12px; margin-top: 18px; }
+.role-error { color: #fecaca; text-align: center; }
+.auth-brand { font: 400 38px/1 Georgia, serif; color: #172536; margin-bottom: 24px; }
+.change-role { border: 0; padding: 6px; margin: -12px 0 20px; color: #1d4ed8; background: none; cursor: pointer; }
+@media (max-width: 600px) {
+  .role-page { padding: 48px 18px; }
+  .role-heading { margin-bottom: 38px; }
+  .role-grid { grid-template-columns: 1fr; gap: 12px; }
+  .role-card { min-height: 0; padding: 22px; }
+}
+@media (prefers-reduced-motion: reduce) { .role-card { transition: none; } }

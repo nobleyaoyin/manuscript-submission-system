@@ -5,12 +5,15 @@ from datetime import datetime, timezone
 from uuid import uuid4
 import os
 import tempfile
+import io
+import zipfile
 from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.database import get_db, BASE_DIR
+from app.config import IS_DEMO, guard_demo_path
 from app.models import (
     Manuscript,
     User,
@@ -18,29 +21,147 @@ from app.models import (
     Review,
     Notification,
     InitialEditorInvitation,
+    ReviewRoundFile,
+    ManuscriptReviewPolicy,
+    AuthorAgreement,
+    FinalEditorInvitation,
+    EICInitialScan,
+    PreReviewConfirmation,
+    EICDecision,
 )
 from app.schemas import ManuscriptCreate, ManuscriptResponse, ManuscriptUpdate, EditorDecision
 from app.routers.users import get_current_user, require_role
+from app.reviewer_invitations import not_declined, may_review
+from app.review_progress import review_progress
+
+def uses_eic_workflow(db: Session, manuscript_id: int) -> bool:
+    """Check whether a manuscript belongs to the EIC-controlled workflow."""
+    evidence_models = (
+        ManuscriptReviewPolicy,
+        EICInitialScan,
+        InitialEditorInvitation,
+        PreReviewConfirmation,
+        EICDecision,
+    )
+
+    for model in evidence_models:
+        evidence_id = db.scalar(
+            select(model.manuscript_id)
+            .where(model.manuscript_id == manuscript_id)
+            .limit(1)
+        )
+
+        if evidence_id is not None:
+            return True
+
+    return False
 
 router = APIRouter(
     prefix="/manuscripts",
     tags=["Manuscripts"]
 )
 
+# Supported manuscript document formats
+ALLOWED_MANUSCRIPT_EXTENSIONS = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+}
 
+MAX_MANUSCRIPT_FILE_SIZE = 10 * 1024 * 1024
+
+
+def validate_manuscript_file(filename: str, content: bytes) -> tuple[str, str]:
+    """
+    Validate a manuscript file and return:
+    (extension, media_type).
+    """
+    extension = Path(filename or "").suffix.lower()
+
+    if extension not in ALLOWED_MANUSCRIPT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, DOCX, and DOC files are allowed",
+        )
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty",
+        )
+
+    if len(content) > MAX_MANUSCRIPT_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds the 10 MB limit",
+        )
+
+    if extension == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid PDF file",
+            )
+
+    elif extension == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+
+                if (
+                    "[Content_Types].xml" not in names
+                    or "word/document.xml" not in names
+                ):
+                    raise ValueError("Missing DOCX document structure")
+
+                if archive.testzip() is not None:
+                    raise ValueError("Corrupted DOCX archive")
+
+        except (zipfile.BadZipFile, ValueError, RuntimeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid DOCX file",
+            )
+
+    elif extension == ".doc":
+        # Legacy Word documents use the OLE Compound File format.
+        ole_signature = bytes.fromhex("D0CF11E0A1B11AE1")
+
+        if not content.startswith(ole_signature):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid DOC file",
+            )
+
+    return extension, ALLOWED_MANUSCRIPT_EXTENSIONS[extension]
 
 # Resolve existing relative paths from the project root.
 def resolve_manuscript_file_path(stored_path: str) -> Path:
     path = Path(stored_path)
-    return path if path.is_absolute() else BASE_DIR / path
-
+    if IS_DEMO and path.is_absolute():
+        raise HTTPException(status_code=409, detail="Invalid demo file path")
+    return guard_demo_path(path if path.is_absolute() else BASE_DIR / path)
 
 def manuscript_has_pdf(manuscript: Manuscript) -> bool:
-    """True only when the current manuscript PDF exists on disk."""
+    """
+    Backward-compatible API helper.
+
+    Despite the legacy name, return True when the manuscript
+    has a supported PDF or Word document.
+    """
+    return manuscript_has_file(manuscript)
+
+def manuscript_has_file(manuscript: Manuscript) -> bool:
+    """Check whether a supported manuscript document exists."""
     if not manuscript.file_path:
         return False
-    return resolve_manuscript_file_path(manuscript.file_path).is_file()
 
+    file_path = resolve_manuscript_file_path(manuscript.file_path)
+
+    return (
+        file_path.is_file()
+        and file_path.suffix.lower() in ALLOWED_MANUSCRIPT_EXTENSIONS
+    )
 
 def manuscript_to_response(manuscript: Manuscript) -> ManuscriptResponse:
     """Serialize a manuscript with its computed PDF availability."""
@@ -84,6 +205,12 @@ def can_access_manuscript(
     # Editors need an accepted initial editor invitation,
     # or an existing peer-review assignment made by them.
     if user.role == "editor":
+        final_invitation = db.scalar(select(FinalEditorInvitation.invitation_id).where(
+            FinalEditorInvitation.manuscript_id == manuscript.manuscript_id,
+            FinalEditorInvitation.editor_id == user.user_id,
+            FinalEditorInvitation.status == 'accepted').limit(1))
+        if final_invitation is not None:
+            return True
         invitation = db.scalar(
             select(InitialEditorInvitation.invitation_id)
             .where(
@@ -99,7 +226,7 @@ def can_access_manuscript(
             return True
 
         assignment = db.scalar(
-            select(ReviewAssignment.assignment_id)
+            select(ReviewAssignment)
             .where(
                 ReviewAssignment.manuscript_id
                 == manuscript.manuscript_id,
@@ -112,17 +239,16 @@ def can_access_manuscript(
 
     # Reviewers need an assignment.
     if user.role == "reviewer":
-        assignment = db.scalar(
-            select(ReviewAssignment.assignment_id)
+        assignments = db.scalars(
+            select(ReviewAssignment)
             .where(
                 ReviewAssignment.manuscript_id
                 == manuscript.manuscript_id,
                 ReviewAssignment.reviewer_id == user.user_id,
             )
-            .limit(1)
-        )
+        ).all()
 
-        return assignment is not None
+        return any(may_review(db, assignment) for assignment in assignments)
 
     return False
 
@@ -221,10 +347,14 @@ def submit_draft_manuscript(
         raise HTTPException(status_code=409, detail="Only draft manuscripts can be submitted")
     if not manuscript.title.strip() or not manuscript.abstract.strip():
         raise HTTPException(status_code=409, detail="Title and abstract are required")
-    if not manuscript_has_pdf(manuscript):
-        raise HTTPException(status_code=409, detail="A PDF is required before submission")
+    if not manuscript_has_file(manuscript):
+        raise HTTPException(
+            status_code=409,
+            detail="A PDF or Word manuscript file is required before submission",
+        )
 
     manuscript.status = "submitted"
+    db.add(ManuscriptReviewPolicy(manuscript_id=manuscript_id, minimum_completed_reviewers=2))
     db.commit()
     db.refresh(manuscript)
     return manuscript_to_response(manuscript)
@@ -322,7 +452,8 @@ def get_editor_dashboard(
         assignments = db.scalars(
             select(ReviewAssignment).where(
                 ReviewAssignment.manuscript_id == manuscript.manuscript_id,
-                ReviewAssignment.review_round == review_round
+                ReviewAssignment.review_round == review_round,
+                not_declined(),
             )
         ).all()
 
@@ -362,9 +493,15 @@ def get_editor_dashboard(
         dashboard.append({
             "manuscript_id": manuscript.manuscript_id,
             "title": manuscript.title,
-            "status": manuscript.status,
+            "status": manuscript.status,"legacy_editor_decision_allowed": (
+                current_user.role == "editor"
+                and manuscript.status in ("submitted", "revised")
+                and not uses_eic_workflow(db, manuscript.manuscript_id)
+            ),
             "has_pdf": manuscript_has_pdf(manuscript),
             "review_round": review_round,
+            "decision_progress": review_progress(db, manuscript, review_round),
+            "author_agreement_status": db.scalar(select(AuthorAgreement.status).where(AuthorAgreement.manuscript_id == manuscript.manuscript_id).order_by(AuthorAgreement.agreement_id.desc()).limit(1)),
             "total_reviewers": total_reviewers,
             "completed_reviews": completed_reviews,
             "pending_reviews": pending_reviews,
@@ -414,7 +551,8 @@ def get_editor_dashboard_summary(
         assignments = db.scalars(
             select(ReviewAssignment).where(
                 ReviewAssignment.manuscript_id == manuscript.manuscript_id,
-                ReviewAssignment.review_round == review_round
+                ReviewAssignment.review_round == review_round,
+                not_declined(),
             )
         ).all()
 
@@ -625,6 +763,22 @@ def make_editor_decision(
             detail="Manuscript not found"
         )
 
+    # First, verify that the editor can access this manuscript.
+    if not can_access_manuscript(db, manuscript, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not an assigned editor",
+        )
+
+    # Prevent the legacy Editor Decision endpoint from bypassing EIC.
+    if uses_eic_workflow(db, manuscript_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This manuscript uses the EIC workflow. "
+                "The EIC must make the editorial decision."
+            ),
+        )
     # Step 2: Decisions are permitted only while a round is under review.
     if manuscript.status not in ("submitted", "revised"):
         raise HTTPException(
@@ -633,11 +787,17 @@ def make_editor_decision(
         )
     current_round = get_current_review_round(db, manuscript)
 
+    # Prevent the older editor endpoint from bypassing the prospective policy.
+    progress = review_progress(db, manuscript, current_round)
+    if progress['policy'] == 'two_reviewers' and not progress['can_decide']:
+        raise HTTPException(status_code=409, detail=progress['blocked_reason'])
+
     # Step 3: Find assignments for the current review round
     assignments = db.scalars(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == manuscript_id,
-            ReviewAssignment.review_round == current_round
+            ReviewAssignment.review_round == current_round,
+            not_declined(),
         )
     ).all()
 
@@ -739,7 +899,7 @@ def resubmit_manuscript(
     # Require a new PDF for the upcoming review round.
     next_round = get_current_review_round(db, manuscript) + 1
 
-    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+    upload_dir = guard_demo_path(BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id))
 
     current_pdf = (
         resolve_manuscript_file_path(manuscript.file_path)
@@ -751,12 +911,20 @@ def resubmit_manuscript(
         current_pdf is None
         or not current_pdf.is_file()
         or current_pdf.parent.resolve() != upload_dir.resolve()
+        or current_pdf.suffix.lower() not in ALLOWED_MANUSCRIPT_EXTENSIONS
         or not current_pdf.name.startswith(f"round_{next_round}_")
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Upload a revised PDF before resubmitting"
+            detail="Upload a revised PDF or Word file before resubmitting"
         )
+
+    try:
+        with current_pdf.open("rb") as revised_file:
+            revised_content = revised_file.read(MAX_MANUSCRIPT_FILE_SIZE + 1)
+    except OSError:
+        raise HTTPException(status_code=409, detail="Revised manuscript file is unavailable")
+    validate_manuscript_file(current_pdf.name, revised_content)
 
     # Step 4: Update manuscript fields
     changes = update_data.model_dump(exclude_unset=True)
@@ -778,6 +946,19 @@ def resubmit_manuscript(
 
     # Step 5: Advance exactly once when the author formally resubmits.
     # PDF uploads for revisions are saved under this upcoming round.
+    existing_round_file = db.scalar(select(ReviewRoundFile).where(
+        ReviewRoundFile.manuscript_id == manuscript_id,
+        ReviewRoundFile.review_round == next_round,
+    ))
+    if existing_round_file is not None:
+        raise HTTPException(status_code=409, detail="A file is already recorded for this review round")
+    db.add(ReviewRoundFile(
+        manuscript_id=manuscript_id,
+        review_round=next_round,
+        source_kind="author_revision",
+        confirmation_id=None,
+        file_path=manuscript.file_path,
+    ))
     manuscript.review_round = next_round
     manuscript.status = "revised"
 
@@ -789,7 +970,7 @@ def resubmit_manuscript(
 
 
 
-@router.post("/{manuscript_id}/upload", summary="Upload Manuscript PDF")
+@router.post("/{manuscript_id}/upload", summary="Upload Manuscript File")
 def upload_manuscript(
     manuscript_id: int,
     file: UploadFile = File(...),
@@ -845,36 +1026,25 @@ def upload_manuscript(
             detail="Cannot upload PDF after reviewer assignment"
         )
 
-    # Step 5: Validate PDF
-    if file.content_type != "application/pdf":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed"
-        )
 
-    # Step 6: Read file with a 10 MB limit
-    max_size = 10 * 1024 * 1024
-    content = file.file.read(max_size + 1)
+    # Step 5: Read the uploaded document (maximum 10 MB)
+    content = file.file.read(MAX_MANUSCRIPT_FILE_SIZE + 1)
 
-    if len(content) > max_size:
-        raise HTTPException(
-            status_code=413,
-            detail="PDF file exceeds 10 MB limit"
-        )
-
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid PDF file"
-        )
+    # Step 6: Validate PDF, DOCX, or DOC
+    extension, media_type = validate_manuscript_file(
+        file.filename,
+        content,
+    )
 
     # Each upload gets a unique filename. Older files remain untouched.
     # Existing legacy uploads/paper.pdf files are also preserved.
-    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+    upload_dir = guard_demo_path(BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id))
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    filename = f"round_{review_round}_{timestamp}_{uuid4().hex[:8]}.pdf"
+
+    filename = f"round_{review_round}_{timestamp}_{uuid4().hex[:8]}{extension}"
+
     file_path = upload_dir / filename
 
     # Write to a temporary file, then atomically publish the completed PDF.
@@ -889,7 +1059,7 @@ def upload_manuscript(
     except OSError:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail="Could not save PDF")
+        raise HTTPException(status_code=500, detail="Could not save manuscript file")
 
     previous_path = manuscript.file_path
     manuscript.file_path = str(file_path.relative_to(BASE_DIR))
@@ -907,20 +1077,22 @@ def upload_manuscript(
         "manuscript_id": manuscript.manuscript_id,
         "filename": filename,
         "file_path": manuscript.file_path,
-        "message": "PDF uploaded successfully"
+        "message": "Manuscript file uploaded successfully"
     }
 
 
 
 @router.get(
     "/{manuscript_id}/download",
-    summary="Download Manuscript PDF"
+    summary="Download Manuscript File"
 )
 def download_manuscript(
     manuscript_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db)
 ):
+    if current_user.role == "reviewer":
+        raise HTTPException(status_code=403, detail="Use your review assignment to download the assigned file")
     # Step 1: Find the manuscript
     manuscript = db.get(Manuscript, manuscript_id)
 
@@ -953,22 +1125,33 @@ def download_manuscript(
             detail="PDF file not found on server"
         )
 
-    # Step 5: Return the PDF file
+
+    # Step 5: Return the manuscript in its original format
+    extension = file_path.suffix.lower()
+
+    media_type = ALLOWED_MANUSCRIPT_EXTENSIONS.get(extension)
+
+    if media_type is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported manuscript file format",
+        )
+
     return FileResponse(
         path=file_path,
-        media_type="application/pdf",
-        filename=f"manuscript_{manuscript_id}.pdf"
+        media_type=media_type,
+        filename=f"manuscript_{manuscript_id}{extension}",
     )
 
-
-
 # List all saved PDF uploads for a manuscript, including legacy paper.pdf.
-@router.get("/{manuscript_id}/versions", summary="List Manuscript PDF Versions")
+@router.get("/{manuscript_id}/versions", summary="List Manuscript File Versions")
 def list_manuscript_versions(
     manuscript_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db)
 ):
+    if current_user.role == "reviewer":
+        raise HTTPException(status_code=403, detail="Reviewers cannot access manuscript version history")
     manuscript = db.get(Manuscript, manuscript_id)
 
     if manuscript is None:
@@ -983,12 +1166,18 @@ def list_manuscript_versions(
             detail="You do not have permission to view PDF versions"
         )
 
-    upload_dir = BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
+    upload_dir = guard_demo_path(BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id))
     versions = []
     if upload_dir.is_dir():
-        for path in upload_dir.glob("*.pdf"):
-            if not path.is_file():
+
+        for path in upload_dir.iterdir():
+            guard_demo_path(path)
+            if (
+                not path.is_file()
+                or path.suffix.lower() not in ALLOWED_MANUSCRIPT_EXTENSIONS
+            ):
                 continue
+
             versions.append({
                 "filename": path.name,
                 "is_current": (
@@ -1004,7 +1193,7 @@ def list_manuscript_versions(
 
 @router.get(
     "/{manuscript_id}/versions/{filename}",
-    summary="Download Historical Manuscript PDF"
+    summary="Download Historical Manuscript File"
 )
 def download_manuscript_version(
     manuscript_id: int,
@@ -1012,6 +1201,8 @@ def download_manuscript_version(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db)
 ):
+    if current_user.role == "reviewer":
+        raise HTTPException(status_code=403, detail="Reviewers cannot access manuscript version history")
     manuscript = db.get(Manuscript, manuscript_id)
 
     if manuscript is None:
@@ -1027,23 +1218,31 @@ def download_manuscript_version(
         )
 
     # Only allow a single basename within this manuscript's upload folder.
+
     if (
         Path(filename).name != filename
-        or not filename.endswith(".pdf")
+        or Path(filename).suffix.lower() not in ALLOWED_MANUSCRIPT_EXTENSIONS
         or filename in (".", "..")
     ):
-        raise HTTPException(status_code=400, detail="Invalid PDF filename")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid manuscript filename",
+        )
 
-    upload_dir = (BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)).resolve()
-    file_path = (upload_dir / filename).resolve()
+
+    upload_dir = guard_demo_path(BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)).resolve()
+    file_path = guard_demo_path(upload_dir / filename).resolve()
     if file_path.parent != upload_dir or not file_path.is_file():
         raise HTTPException(status_code=404, detail="PDF version not found")
 
     return FileResponse(
         path=file_path,
-        media_type="application/pdf",
-        filename=filename
+        media_type=ALLOWED_MANUSCRIPT_EXTENSIONS[
+            file_path.suffix.lower()
+        ],
+        filename=filename,
     )
+
 
 @router.post(
     "/{manuscript_id}/initial-resubmit",
@@ -1092,7 +1291,7 @@ def initial_resubmit_manuscript(
             detail="Peer review has already started",
         )
 
-    # Verify that the author uploaded a new PDF after the
+    # Verify that the author uploaded a new manuscript file after the
     # most recent EIC initial scan.
     from app.models import EICInitialScan
 
@@ -1112,29 +1311,29 @@ def initial_resubmit_manuscript(
             detail="No pending EIC revision request",
         )
 
-    if not manuscript_has_pdf(manuscript):
+    if not manuscript_has_file(manuscript):
         raise HTTPException(
             status_code=409,
-            detail="Upload a revised PDF before resubmitting",
+            detail="Upload a revised PDF or Word file before resubmitting",
         )
 
-    current_pdf = resolve_manuscript_file_path(manuscript.file_path)
+    current_file = resolve_manuscript_file_path(manuscript.file_path)
 
-    # Uploaded PDFs use UTC timestamps in their filenames.
-    # The PDF must belong to this manuscript and be newer
+    # Uploaded manuscript files use UTC timestamps in their filenames.
+    # The file must belong to this manuscript and be newer
     # than the latest EIC revision request.
-    upload_dir = (
+    upload_dir = guard_demo_path(
         BASE_DIR / "uploads" / "manuscripts" / str(manuscript_id)
     ).resolve()
 
-    if current_pdf.parent.resolve() != upload_dir:
+    if current_file.parent.resolve() != upload_dir:
         raise HTTPException(
             status_code=409,
-            detail="Upload a revised PDF before resubmitting",
+            detail="Upload a revised PDF or Word file before resubmitting",
         )
 
     try:
-        timestamp_text = current_pdf.name.split("_")[2]
+        timestamp_text = current_file.name.split("_")[2]
         upload_time = datetime.strptime(
             timestamp_text,
             "%Y%m%dT%H%M%S%fZ",
@@ -1146,12 +1345,12 @@ def initial_resubmit_manuscript(
             scan_time = scan_time.replace(tzinfo=timezone.utc)
 
         if upload_time <= scan_time:
-            raise ValueError("PDF predates the EIC revision request")
+            raise ValueError("Manuscript file predates the EIC revision request")
 
     except (ValueError, IndexError):
         raise HTTPException(
             status_code=409,
-            detail="Upload a new revised PDF before resubmitting",
+            detail="Upload a new revised PDF or Word file before resubmitting",
         )
 
     # Update optional manuscript metadata.

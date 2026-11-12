@@ -1,12 +1,12 @@
 
-from pathlib import Path
+from app.config import DATA_ROOT
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
 # Store the SQLite database in the project root directory
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = DATA_ROOT
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'manuscript.db'}"
 
 

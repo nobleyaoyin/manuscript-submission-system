@@ -5,11 +5,18 @@ import "./App.css";
 import AuthorDashboard from "./AuthorDashboard";
 import ReviewerDashboard from "./ReviewerDashboard";
 import EditorDashboard from "./EditorDashboard";
+import EICDashboard from "./EICDashboard";
+import FormattingPanel from "./FormattingPanel";
+import { PRODUCT_DISPLAY_NAME } from "./branding";
+import RoleSelection from "./RoleSelection";
+import { roleLabels } from "./roleLabels";
 
-const API_URL = "http://127.0.0.1:8000";
+import { API_URL } from "./api";
+import VerifyEmail from "./VerifyEmail";
 
 function App() {
   const [isLogin, setIsLogin] = useState(true);
+  const [selectedRole, setSelectedRole] = useState(null);
 
   const [form, setForm] = useState({
     name: "",
@@ -28,6 +35,7 @@ function App() {
 
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [needsEmailVerification, setNeedsEmailVerification] = useState(false);
 
   // Send requests to FastAPI
   const apiRequest = async (endpoint, options = {}) => {
@@ -55,9 +63,16 @@ function App() {
 
     if (!response.ok) {
       const detail = data.detail;
+      const tunnelSessionError =
+        response.status === 401 &&
+        !contentType.includes("application/json") &&
+        typeof detail === "string" &&
+        detail.trim() === "Unauthorized";
 
       const requestError = new Error(
-        typeof detail === "string"
+        tunnelSessionError
+          ? "Your protected tunnel session may have expired. Refresh this page and sign in through Cloudflare again, then retry."
+          : typeof detail === "string"
           ? detail
           : JSON.stringify(detail || "Request failed")
       );
@@ -140,6 +155,7 @@ function App() {
     setLoading(true);
     setError("");
     setMessage("");
+    setNeedsEmailVerification(false);
 
     try {
       if (isLogin) {
@@ -156,6 +172,12 @@ function App() {
         const currentUser = await fetchCurrentUser(
           loginData.access_token
         );
+
+        if (currentUser.role !== selectedRole) {
+          setForm(previous => ({ ...previous, password: "" }));
+          setError("The account does not match the selected sign-in role. Choose the correct role and try again.");
+          return;
+        }
 
         // Step 3: Save login state
         sessionStorage.setItem(
@@ -183,10 +205,11 @@ function App() {
         });
 
         setMessage(
-          "Registration successful! Please sign in."
+          "Registration successful! If a verification email was sent, please verify your email address before signing in."
         );
 
         setIsLogin(true);
+        setSelectedRole("author");
 
         setForm({
           name: "",
@@ -195,7 +218,48 @@ function App() {
         });
       }
     } catch (err) {
-      setError(err.message || "Something went wrong.");
+      const errorMessage = err.message || "Something went wrong.";
+      setError(errorMessage);
+
+      if (
+        isLogin &&
+        err.status === 403 &&
+        errorMessage.includes("verify your email address")
+      ) {
+        setNeedsEmailVerification(true);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Resend email verification without requiring a login token.
+  const handleResendVerification = async () => {
+    if (!form.email || !form.password) {
+      setError("Enter your email and password first.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const result = await apiRequest("/users/resend-verification", {
+        method: "POST",
+        body: JSON.stringify({
+          email: form.email,
+          password: form.password,
+        }),
+      });
+
+      if (result.sent) {
+        setMessage("Verification email sent. Please check your inbox.");
+      } else {
+        setMessage(result.message || "No verification email was sent.");
+      }
+    } catch (err) {
+      setError(err.message || "Unable to resend verification email.");
     } finally {
       setLoading(false);
     }
@@ -219,6 +283,7 @@ function App() {
     });
 
     setIsLogin(true);
+    setSelectedRole(null);
   };
 
   // Show loading screen while restoring login
@@ -249,6 +314,8 @@ function App() {
     );
   }
 
+  if (user && user.role === "formatter") return <main><h1>Formatter Dashboard</h1><p>Welcome, {user.name}</p><button onClick={handleLogout}>Logout</button><FormattingPanel role="formatter" token={token} /></main>;
+
   // Show Reviewer Dashboard after login
   if (user && user.role === "reviewer") {
     return (
@@ -269,6 +336,10 @@ function App() {
         onLogout={handleLogout}
       />
     );
+  }
+
+  if (user && user.role === "eic") {
+    return <EICDashboard user={user} token={token} onLogout={handleLogout} />;
   }
 
   // Fallback for an unknown user role
@@ -318,16 +389,21 @@ function App() {
   }
 
   // Login / Register page
+  if (!selectedRole) {
+    return <RoleSelection onSelect={(role) => { setSelectedRole(role); setError(""); setMessage(""); }} error={error} />;
+  }
+
   return (
     <div className="auth-page">
       <div className="auth-card">
-        <div className="brand-icon">M</div>
+        <div className="auth-brand">{PRODUCT_DISPLAY_NAME}<span>.</span></div>
 
-        <h1>Manuscript Submission System</h1>
+        <h1>{isLogin ? "Sign in" : "Create author account"}</h1>
 
         <p className="subtitle">
-          Manage submissions, reviews, and editorial decisions.
+          {isLogin ? `Selected role: ${roleLabels[selectedRole]}` : "Registration creates an Author / Submitter account."}
         </p>
+        <button type="button" className="change-role" onClick={() => { setSelectedRole(null); setIsLogin(true); setError(""); setMessage(""); setForm({ name: "", email: "", password: "" }); }}>← Choose a different role</button>
 
         <div className="auth-tabs">
           <button
@@ -356,16 +432,27 @@ function App() {
         </div>
 
         {error && (
-          <div className="error-message">
+          <div className="error-message" role="alert">
             {error}
           </div>
         )}
 
         {message && (
-          <div className="success-message">
+          <div className="success-message" role="status">
             {message}
           </div>
         )}
+
+        {isLogin && needsEmailVerification && (
+            <button
+              type="button"
+              className="change-role"
+              onClick={handleResendVerification}
+              disabled={loading}
+            >
+              {loading ? "Sending..." : "Resend Verification Email"}
+            </button>
+          )}
 
         <form onSubmit={handleSubmit}>
           {!isLogin && (
@@ -440,4 +527,12 @@ function App() {
   );
 }
 
-export default App;
+function AppRouter() {
+  if (window.location.pathname === "/verify-email") {
+    return <VerifyEmail />;
+  }
+
+  return <App />;
+}
+
+export default AppRouter;

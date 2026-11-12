@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import "./ReviewerDashboard.css";
 import NotificationBell from "./NotificationBell";
 
-const API_URL = "http://127.0.0.1:8000";
+import { API_URL } from "./api";
 
 function ReviewerDashboard({ user, token, onLogout }) {
   const [assignments, setAssignments] = useState([]);
@@ -105,6 +105,22 @@ function ReviewerDashboard({ user, token, onLogout }) {
     await loadAssignments();
   };
 
+  const respondInvitation = async (assignmentId, decision) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmittingId(assignmentId); setError(""); setMessage("");
+    try {
+      const response = await fetch(`${API_URL}/assignments/${assignmentId}/invitation-response`, {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ decision }),
+      });
+      await readResponse(response, "Invitation response failed");
+      await loadAssignments();
+      setMessage(`Invitation ${decision === "accept" ? "accepted" : "declined"}.`);
+    } catch (err) { setError(err.message || "Invitation response failed."); }
+    finally { submittingRef.current = false; setSubmittingId(null); }
+  };
+
   // Update review form values
   const handleReviewChange = (assignmentId, field, value) => {
     setReviews((previous) => ({
@@ -185,22 +201,22 @@ function ReviewerDashboard({ user, token, onLogout }) {
     }
   };
 
-  // Download assigned manuscript PDF
-  const handleDownload = async (manuscriptId, hasPdf) => {
+  // Download the file bound to this assignment.
+  const handleDownload = async (assignmentId, available) => {
     if (downloadingId !== null) return;
 
-    if (!hasPdf) {
-      setError("No PDF has been uploaded for this manuscript.");
+    if (!available) {
+      setError("The review file is unavailable. Contact the editorial team.");
       return;
     }
 
-    setDownloadingId(manuscriptId);
+    setDownloadingId(assignmentId);
     setError("");
     setMessage("");
 
     try {
       const response = await fetch(
-        `${API_URL}/manuscripts/${manuscriptId}/download`,
+        `${API_URL}/assignments/${assignmentId}/download`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -209,21 +225,41 @@ function ReviewerDashboard({ user, token, onLogout }) {
       );
 
       if (!response.ok) {
-        await readResponse(response, "PDF download failed");
+        await readResponse(response, "Review file download failed");
         return;
       }
 
       const blob = await response.blob();
 
       if (blob.size === 0) {
-        throw new Error("Downloaded PDF is empty.");
+        throw new Error("Downloaded review file is empty.");
       }
 
+      const formats = {
+        "application/pdf": ".pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/msword": ".doc",
+      };
+      const extension = formats[(response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase()];
+      if (!extension) throw new Error("Unsupported review file format.");
+      const disposition = response.headers.get("content-disposition") || "";
+      const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      const plain = disposition.match(/filename="([^"]+)"|filename=([^;]+)/i);
+      let filename = "";
+      try {
+        filename = encoded ? decodeURIComponent(encoded[1]) : (plain?.[1] || plain?.[2] || "").trim();
+      } catch {
+        filename = "";
+      }
+      filename = filename.split(/[\\/]/).pop();
+      if (!filename || !filename.toLowerCase().endsWith(extension) || [...filename].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)) {
+        filename = `review_assignment_${assignmentId}${extension}`;
+      }
       const url = URL.createObjectURL(blob);
 
       const link = document.createElement("a");
       link.href = url;
-      link.download = `manuscript_${manuscriptId}.pdf`;
+      link.download = filename;
 
       document.body.appendChild(link);
       link.click();
@@ -233,7 +269,7 @@ function ReviewerDashboard({ user, token, onLogout }) {
         URL.revokeObjectURL(url);
       }, 1000);
     } catch (err) {
-      setError(err.message || "PDF download failed.");
+      setError(err.message || "Review file download failed.");
     } finally {
       setDownloadingId(null);
     }
@@ -245,7 +281,7 @@ function ReviewerDashboard({ user, token, onLogout }) {
   ).length;
 
   const pendingCount = assignments.filter(
-    (assignment) => assignment.status === "assigned"
+    (assignment) => assignment.status === "assigned" && assignment.invitation_status !== "declined"
   ).length;
 
   const handleNotificationNavigate = (notification) => {
@@ -371,7 +407,10 @@ function ReviewerDashboard({ user, token, onLogout }) {
                   assignment.status === "completed";
 
                 const isAssigned =
-                  assignment.status === "assigned";
+                  assignment.status === "assigned" && ["accepted", "legacy"].includes(assignment.invitation_status);
+
+                const invitationPending = assignment.invitation_status === "pending";
+                const invitationDeclined = assignment.invitation_status === "declined";
 
                 const isSubmitting =
                   submittingId === assignmentId;
@@ -410,6 +449,9 @@ function ReviewerDashboard({ user, token, onLogout }) {
                       {" · "}
                       Review Round {assignment.review_round}
                     </p>
+                    <p className="reviewer-meta">Invitation: {assignment.invitation_status === "legacy" ? "existing assignment" : assignment.invitation_status}</p>
+                    {invitationPending && <div><p>Respond to this invitation before accessing the review file.</p><button type="button" disabled={submittingId !== null} onClick={() => respondInvitation(assignmentId, "accept")}>Accept review invitation</button> <button type="button" disabled={submittingId !== null} onClick={() => respondInvitation(assignmentId, "decline")}>Decline review invitation</button></div>}
+                    {invitationDeclined && <p>Review invitation declined.</p>}
 
                     <p className="reviewer-meta">
                       Assigned:{" "}
@@ -418,21 +460,21 @@ function ReviewerDashboard({ user, token, onLogout }) {
                       ).toLocaleDateString()}
                     </p>
 
-                    {assignment.has_pdf ? (
+                    {(invitationPending || invitationDeclined) ? null : assignment.review_file_available ? (
                       <button
                         type="button"
                         className="reviewer-download"
                         disabled={downloadingId !== null}
                         onClick={() =>
-                          handleDownload(assignment.manuscript_id, assignment.has_pdf)
+                          handleDownload(assignmentId, assignment.review_file_available)
                         }
                       >
-                        {downloadingId === assignment.manuscript_id
+                        {downloadingId === assignmentId
                           ? "Downloading..."
-                          : "Download Manuscript PDF"}
+                          : "Download Review File"}
                       </button>
                     ) : (
-                      <p className="reviewer-meta">No PDF Uploaded</p>
+                      <p className="reviewer-meta">Review file unavailable. Contact the editorial team.</p>
                     )}
 
                     {isAssigned && (

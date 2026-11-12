@@ -2,8 +2,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./EditorDashboard.css";
 import NotificationBell from "./NotificationBell";
+import ReviewerInvitationPanel from "./ReviewerInvitationPanel";
+import InitialEditingPanel from "./InitialEditingPanel";
+import FinalEditingPanel from "./FinalEditingPanel";
 
-const API_URL = "http://127.0.0.1:8000";
+import { API_URL } from "./api";
 
 function EditorDashboard({ user, token, onLogout }) {
   const [manuscripts, setManuscripts] = useState([]);
@@ -13,7 +16,6 @@ function EditorDashboard({ user, token, onLogout }) {
   const [message, setMessage] = useState("");
 
   const [expandedId, setExpandedId] = useState(null);
-  const [reviewerIds, setReviewerIds] = useState({});
   const [decisions, setDecisions] = useState({});
   const [reviewHistory, setReviewHistory] = useState({});
   const [historyLoadingId, setHistoryLoadingId] = useState(null);
@@ -228,71 +230,6 @@ function EditorDashboard({ user, token, onLogout }) {
     }
   };
 
-  // Assign reviewer
-  const handleAssignReviewer = async (manuscript) => {
-    if (actionLock.current) return;
-
-    const manuscriptId = manuscript.manuscript_id;
-    const reviewerId = Number(reviewerIds[manuscriptId]);
-    const progress = getCurrentRoundProgress(manuscript);
-
-    if (!Number.isInteger(reviewerId) || reviewerId <= 0) {
-      setError("Please enter a valid Reviewer ID.");
-      return;
-    }
-
-    if (
-      !["submitted", "revised"].includes(manuscript.status) ||
-      (progress.total > 0 && progress.pending === 0)
-    ) {
-      setError(
-        "Reviewer assignment is unavailable for this manuscript."
-      );
-      return;
-    }
-
-    actionLock.current = true;
-    setActionLoadingId(manuscriptId);
-    setError("");
-    setMessage("");
-
-    try {
-      await apiRequest("/assignments/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          manuscript_id: manuscriptId,
-          reviewer_id: reviewerId,
-          review_round: getActiveRound(manuscript),
-        }),
-      });
-
-      setReviewerIds((previous) => ({
-        ...previous,
-        [manuscriptId]: "",
-      }));
-
-      const refreshed = await loadDashboard();
-
-      if (refreshed) {
-        setMessage(
-          `Reviewer #${reviewerId} assigned to Manuscript #${manuscriptId}.`
-        );
-      } else {
-        setMessage(
-          `Reviewer #${reviewerId} assigned successfully, but the dashboard could not be refreshed.`
-        );
-      }
-    } catch (err) {
-      setError(err.message || "Reviewer assignment failed.");
-    } finally {
-      actionLock.current = false;
-      setActionLoadingId(null);
-    }
-  };
-
   // Load review history
   const handleViewReviews = async (manuscriptId) => {
     if (historyLoadingId !== null) return;
@@ -323,7 +260,12 @@ function EditorDashboard({ user, token, onLogout }) {
   // Submit editor decision
   const handleDecision = async (manuscript) => {
     if (actionLock.current) return;
-
+    if (manuscript.legacy_editor_decision_allowed !== true) {
+      setError(
+        "The EIC must make the editorial decision for this manuscript."
+      );
+      return;
+  }
     const manuscriptId = manuscript.manuscript_id;
     const decision = decisions[manuscriptId];
     const progress = getCurrentRoundProgress(manuscript);
@@ -445,6 +387,8 @@ function EditorDashboard({ user, token, onLogout }) {
       </header>
 
       <main className="editor-main">
+        <FinalEditingPanel role="editor" token={token} onChanged={loadDashboard} />
+        <InitialEditingPanel role="editor" token={token} onChanged={loadDashboard} />
         <div className="editor-heading">
           <div>
             <h2>Welcome, {user.name}!</h2>
@@ -521,13 +465,13 @@ function EditorDashboard({ user, token, onLogout }) {
                       "revised",
                     ].includes(manuscript.status);
 
-                    // Stop assigning after all current reviews finish
-                    const canAssign =
-                      isOpen &&
-                      (progress.total === 0 || progress.pending > 0);
+                    const legacyDecisionAllowed =
+                      manuscript.legacy_editor_decision_allowed === true;
 
                     const canDecide =
+                      legacyDecisionAllowed &&
                       isOpen &&
+                      manuscript.decision_progress?.can_decide &&
                       progress.total > 0 &&
                       progress.pending === 0 &&
                       progress.completed === progress.total;
@@ -556,6 +500,7 @@ function EditorDashboard({ user, token, onLogout }) {
                         </div>
 
                         <div className="editor-progress">
+                          {manuscript.decision_progress && <span>Decision review progress: <strong>{Math.min(manuscript.decision_progress.completed_distinct, manuscript.decision_progress.required)}/{manuscript.decision_progress.required}</strong>{manuscript.decision_progress.policy === "legacy" ? " (historical rule)" : ""}</span>}
                           <span>
                             Completed Reviews:{" "}
                             <strong>
@@ -568,6 +513,7 @@ function EditorDashboard({ user, token, onLogout }) {
                             <strong>{progress.pending}</strong>
                           </span>
                         </div>
+                        {["ready_for_peer_review", "revised"].includes(manuscript.status) && manuscript.decision_progress?.blocked_reason && <p>Decision blocked: {manuscript.decision_progress.blocked_reason}</p>}
 
                         <div className="editor-review-status">
                           Review Status:{" "}
@@ -575,6 +521,7 @@ function EditorDashboard({ user, token, onLogout }) {
                             {formatStatus(progress.reviewStatus)}
                           </strong>
                         </div>
+                        {manuscript.author_agreement_status && <p>Author agreement: {formatStatus(manuscript.author_agreement_status)}{manuscript.author_agreement_status !== "accepted" ? " · final editing is on hold" : ""}</p>}
 
                         <button
                           type="button"
@@ -615,50 +562,7 @@ function EditorDashboard({ user, token, onLogout }) {
                               )}
                             </div>
 
-                            {/* Assign Reviewer */}
-                            {canAssign && (
-                              <div className="editor-action-block">
-                                <h4>Assign Reviewer</h4>
-
-                                <p>
-                                  Assign a reviewer for Review Round{" "}
-                                  {activeRound}.
-                                </p>
-
-                                <div className="editor-action-row">
-                                  <input
-                                    type="number"
-                                    min="1"
-                                    step="1"
-                                    placeholder="Reviewer ID (e.g. 3)"
-                                    value={
-                                      reviewerIds[manuscriptId] ?? ""
-                                    }
-                                    disabled={isBusy}
-                                    onChange={(event) =>
-                                      setReviewerIds((previous) => ({
-                                        ...previous,
-                                        [manuscriptId]:
-                                          event.target.value,
-                                      }))
-                                    }
-                                  />
-
-                                  <button
-                                    type="button"
-                                    className="editor-primary-button"
-                                    disabled={isBusy}
-                                    onClick={() =>
-                                      handleAssignReviewer(manuscript)
-                                    }
-                                  >
-                                    {actionLoadingId === manuscriptId
-                                      ? "Processing..."
-                                      : "Assign Reviewer"}
-                                  </button>
-                                </div>
-                              </div>
-                            )}
+                            <ReviewerInvitationPanel manuscriptId={manuscriptId} round={activeRound} status={manuscript.status} token={token} />
 
                             {/* Review History */}
                             <div className="editor-action-block">
@@ -728,7 +632,11 @@ function EditorDashboard({ user, token, onLogout }) {
                               <div className="editor-action-block">
                                 <h4>Editor Decision</h4>
 
-                                {canDecide ? (
+                                {!legacyDecisionAllowed ? (
+                                  <p>
+                                    The EIC makes the editorial decision for this manuscript.
+                                  </p>
+                                ) : canDecide ? (
                                   <>
                                     <p>
                                       All assigned reviewers have completed

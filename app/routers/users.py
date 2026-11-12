@@ -1,14 +1,23 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from collections import deque
+from threading import Lock
+from time import monotonic
+from app.config import IS_DEMO
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.email.registration_verification import (
+    prepare_registration_verification,
+    deliver_registration_verification,
+)
 from app.models import User
+from app.email.verification_service import is_email_verified
 from app.schemas import UserCreate, UserResponse, UserLogin
 from app.security import (
     hash_password,
@@ -25,6 +34,22 @@ router = APIRouter(
 
 # Read Bearer token from Authorization header
 bearer_scheme = HTTPBearer(auto_error=False)
+
+# Single-process limiter: do not trust client-supplied forwarding headers.
+# The global cap also bounds memory and protects the local demo behind a tunnel.
+_login_attempts = deque()
+_login_lock = Lock()
+
+
+def limit_login(request: Request):
+    now = monotonic()
+    client = request.client.host if request.client else "unknown"
+    with _login_lock:
+        while _login_attempts and _login_attempts[0][0] <= now - 60:
+            _login_attempts.popleft()
+        if len(_login_attempts) >= 100 or sum(item[1] == client for item in _login_attempts) >= 10:
+            raise HTTPException(status_code=429, detail="Too many login attempts; try again later", headers={"Retry-After": "60"})
+        _login_attempts.append((now, client))
 
 
 # Normalize email consistently for registration and login
@@ -68,6 +93,25 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Block unverified enrolled accounts, including existing JWTs.
+    # Preserve legacy accounts and demo compatibility.
+    if not IS_DEMO:
+        from app.models import UserEmailVerification
+
+        verification_state = db.get(
+            UserEmailVerification,
+            user.user_id,
+        )
+
+        if (
+            verification_state is not None
+            and not is_email_verified(db, user)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Please verify your email address before continuing.",
+            )
+
     return user
 
 
@@ -99,6 +143,12 @@ def register_user(
     user_data: UserCreate,
     db: Session = Depends(get_db),
 ):
+    if IS_DEMO:
+        raise HTTPException(
+            status_code=403,
+            detail="Registration is disabled in demo mode",
+        )
+
     email = normalize_email(str(user_data.email))
 
     existing_user = db.scalar(
@@ -121,7 +171,15 @@ def register_user(
     db.add(new_user)
 
     try:
+        db.flush()
+
+        verification_token = prepare_registration_verification(
+            db,
+            new_user,
+        )
+
         db.commit()
+
     except IntegrityError:
         db.rollback()
         raise HTTPException(
@@ -129,7 +187,18 @@ def register_user(
             detail="Email already registered",
         )
 
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(new_user)
+
+    # Email delivery happens only after the database commit.
+    # Failure does not remove the successfully created account.
+    deliver_registration_verification(
+        recipient=new_user.email,
+        token=verification_token,
+    )
 
     return new_user
 
@@ -138,8 +207,10 @@ def register_user(
 @router.post("/login")
 def login_user(
     login_data: UserLogin,
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    limit_login(request)
     email = normalize_email(str(login_data.email))
 
     user = db.scalar(
@@ -154,6 +225,25 @@ def login_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
+
+    # Require verification for accounts enrolled in email verification.
+    # Legacy accounts without a verification record remain compatible.
+    if not IS_DEMO:
+        from app.models import UserEmailVerification
+
+        verification_state = db.get(
+            UserEmailVerification,
+            user.user_id,
+        )
+
+        if (
+            verification_state is not None
+            and not is_email_verified(db, user)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Please verify your email address before signing in.",
+            )
 
     access_token = create_access_token(user.user_id)
 

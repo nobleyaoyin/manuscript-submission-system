@@ -120,12 +120,15 @@ class ReviewAssignmentResponse(BaseModel):
     assigned_by: int
     review_round: int
     status: str
+    invitation_status: str = "legacy"
     assigned_at: datetime
 
     # Additional manuscript information for the reviewer dashboard
     manuscript_title: str | None = None
     manuscript_status: str | None = None
     has_pdf: bool = False
+    review_file_available: bool = False
+    review_file_status: str = "unavailable"
 
     model_config = ConfigDict(from_attributes=True)
 

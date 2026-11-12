@@ -2,6 +2,7 @@
 import os
 import tempfile
 from pathlib import Path
+from app.config import DATA_ROOT, guard_demo_path
 from uuid import uuid4
 from datetime import datetime, timezone
 
@@ -24,6 +25,9 @@ from app.models import (
     Review,
     EICDecision,
     FinalEditingSubmission,
+    AuthorAgreement,
+    FinalEditorInvitation,
+    FinalEditingSubmissionInvitation,
 )
 
 from app.schemas import (
@@ -38,12 +42,88 @@ from app.schemas import (
     EICDecisionCreate,
 )
 from app.routers.users import require_role
+from app.reviewer_invitations import invitation_status, not_declined
+from app.review_progress import review_progress
+from app.agreement_content import AGREEMENT_TEXT, AGREEMENT_VERSION
+from app.routers.final_workflow import summary_invitation, submissions as final_workflow_submissions
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = DATA_ROOT
 router = APIRouter(
     prefix="/eic",
     tags=["EIC"],
 )
+
+
+@router.get("/initial-editing/my", summary="List my initial editing workflow items")
+def my_initial_editing(current_user: User = Depends(require_role("author", "editor")), db: Session = Depends(get_db)):
+    if current_user.role == "author":
+        manuscripts = db.scalars(select(Manuscript).where(Manuscript.author_id == current_user.user_id, Manuscript.status != "draft").order_by(Manuscript.manuscript_id.desc())).all()
+    else:
+        manuscripts = db.scalars(select(Manuscript).join(InitialEditorInvitation, InitialEditorInvitation.manuscript_id == Manuscript.manuscript_id).where(InitialEditorInvitation.editor_id == current_user.user_id, InitialEditorInvitation.status.in_(["pending", "accepted"]), Manuscript.status != "draft").distinct().order_by(Manuscript.manuscript_id.desc())).all()
+    result = []
+    for manuscript in manuscripts:
+        invitation_query = select(InitialEditorInvitation).where(InitialEditorInvitation.manuscript_id == manuscript.manuscript_id)
+        if current_user.role == "editor":
+            invitation_query = invitation_query.where(InitialEditorInvitation.editor_id == current_user.user_id, InitialEditorInvitation.status.in_(["pending", "accepted"]))
+        invitation = db.scalar(invitation_query.order_by(InitialEditorInvitation.invitation_id.desc()).limit(1))
+        # A pending invitation permits its recipient to see only the invitation, not editing history.
+        submissions = []
+        if current_user.role == "author" or (invitation and invitation.status == "accepted"):
+            query = select(InitialEditingSubmission).where(InitialEditingSubmission.manuscript_id == manuscript.manuscript_id)
+            if current_user.role == "editor":
+                query = query.where(InitialEditingSubmission.editor_id == current_user.user_id)
+            submissions = db.scalars(query.order_by(InitialEditingSubmission.submission_id.desc())).all()
+        if not invitation and not submissions:
+            continue
+        editor = db.get(User, invitation.editor_id) if invitation else None
+        items = []
+        for submission in submissions:
+            confirmation = db.scalar(select(PreReviewConfirmation).where(PreReviewConfirmation.submission_id == submission.submission_id).order_by(PreReviewConfirmation.confirmation_id.desc()).limit(1))
+            items.append({"submission_id": submission.submission_id, "status": submission.status, "comments": submission.comments, "author_comments": submission.author_comments, "editor_comments": submission.editor_comments, "eic_comments": submission.eic_comments, "confirmation": confirmation.decision if confirmation else None})
+        result.append({"manuscript_id": manuscript.manuscript_id, "title": manuscript.title, "status": manuscript.status, "invitation": {"invitation_id": invitation.invitation_id, "status": invitation.status, "editor": editor.name if editor else "Unknown"} if invitation else None, "submissions": items})
+    return result
+
+
+@router.get("/editors", summary="List editors for initial invitations")
+def list_editors(current_user: User = Depends(require_role("eic")), db: Session = Depends(get_db)):
+    return [{"user_id": u.user_id, "name": u.name} for u in db.scalars(
+        select(User).where(User.role == "editor").order_by(User.name, User.user_id)
+    )]
+
+
+@router.get("/manuscripts/{manuscript_id}/overview", summary="EIC manuscript workflow overview")
+def manuscript_overview(manuscript_id: int, current_user: User = Depends(require_role("eic")), db: Session = Depends(get_db)):
+    manuscript = db.get(Manuscript, manuscript_id)
+    # Drafts remain private, including from EICs.
+    if manuscript is None or manuscript.status == "draft":
+        raise HTTPException(status_code=404, detail="Manuscript not found")
+    author = db.get(User, manuscript.author_id)
+    invitations = db.scalars(select(InitialEditorInvitation).where(InitialEditorInvitation.manuscript_id == manuscript_id).order_by(InitialEditorInvitation.invitation_id)).all()
+    submissions = db.scalars(select(InitialEditingSubmission).where(InitialEditingSubmission.manuscript_id == manuscript_id).order_by(InitialEditingSubmission.submission_id)).all()
+    assignments = db.scalars(select(ReviewAssignment).where(ReviewAssignment.manuscript_id == manuscript_id).order_by(ReviewAssignment.review_round, ReviewAssignment.assignment_id)).all()
+    scans = db.scalars(select(EICInitialScan).where(EICInitialScan.manuscript_id == manuscript_id).order_by(EICInitialScan.scan_id)).all()
+    decisions = db.scalars(select(EICDecision).where(EICDecision.manuscript_id == manuscript_id).order_by(EICDecision.decision_id)).all()
+    confirmations = db.scalars(select(PreReviewConfirmation).where(PreReviewConfirmation.manuscript_id == manuscript_id).order_by(PreReviewConfirmation.confirmation_id)).all()
+    finals = db.scalars(select(FinalEditingSubmission).where(FinalEditingSubmission.manuscript_id == manuscript_id).order_by(FinalEditingSubmission.submission_id)).all()
+    final_invitations = db.scalars(select(FinalEditorInvitation).where(FinalEditorInvitation.manuscript_id == manuscript_id).order_by(FinalEditorInvitation.invitation_id)).all()
+    agreement = db.scalar(select(AuthorAgreement).where(AuthorAgreement.manuscript_id == manuscript_id).order_by(AuthorAgreement.agreement_id.desc()).limit(1))
+    def name(user_id):
+        user = db.get(User, user_id)
+        return user.name if user else f"User #{user_id}"
+    return {
+        "manuscript": {"manuscript_id": manuscript_id, "title": manuscript.title, "abstract": manuscript.abstract, "status": manuscript.status, "review_round": manuscript.review_round, "author": author.name if author else "Unknown", "created_at": manuscript.created_at},
+        "review_progress": review_progress(db, manuscript),
+        "author_agreement": {"status": agreement.status, "agreement_version": agreement.agreement_version, "responded_at": agreement.responded_at} if agreement else None,
+        "scans": [{"decision": s.decision, "comments": s.comments, "created_at": s.created_at} for s in scans],
+        "invitations": [{"invitation_id": i.invitation_id, "editor": name(i.editor_id), "status": i.status, "invited_at": i.invited_at} for i in invitations],
+        "submissions": [{"submission_id": s.submission_id, "editor": name(s.editor_id), "status": s.status, "comments": s.comments, "author_comments": s.author_comments, "editor_comments": s.editor_comments, "eic_comments": s.eic_comments, "created_at": s.created_at} for s in submissions],
+        "confirmations": [{"submission_id": c.submission_id, "decision": c.decision, "comments": c.comments, "confirmed_at": c.confirmed_at} for c in confirmations],
+        "assignments": [{"assignment_id": a.assignment_id, "review_round": a.review_round, "reviewer": name(a.reviewer_id), "assigned_by": name(a.assigned_by), "status": a.status, "invitation_status": invitation_status(db, a), "review": ({"comments": r.comments, "recommendation": r.recommendation, "submitted_at": r.submitted_at} if (r := db.scalar(select(Review).where(Review.assignment_id == a.assignment_id))) else None)} for a in assignments],
+        "decisions": [{"review_round": d.review_round, "decision": d.decision, "comments": d.comments, "decided_at": d.decided_at} for d in decisions],
+        "final_submissions": [{"submission_id": f.submission_id, "editor": name(f.editor_id), "status": f.status, "comments": f.comments} for f in finals],
+        "final_invitations": [summary_invitation(db, i) for i in final_invitations],
+        "final_workflow_submissions": final_workflow_submissions(db, manuscript_id),
+    }
 
 
 @router.post(
@@ -408,7 +488,7 @@ def submit_initial_editing(
         )
 
     # Step 7: Save the edited PDF separately from the original.
-    upload_dir = (
+    upload_dir = guard_demo_path(
         BASE_DIR / "uploads" / "initial_editing" / str(manuscript_id)
     )
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -547,14 +627,14 @@ def download_initial_editing_pdf(
         )
 
     # Step 4: Resolve the stored PDF path safely.
-    upload_root = (
+    upload_root = guard_demo_path(
         BASE_DIR
         / "uploads"
         / "initial_editing"
         / str(manuscript.manuscript_id)
     ).resolve()
 
-    pdf_path = (BASE_DIR / submission.file_path).resolve()
+    pdf_path = guard_demo_path(BASE_DIR / submission.file_path).resolve()
 
     if (
         not pdf_path.is_relative_to(upload_root)
@@ -959,8 +1039,8 @@ def confirm_pre_review_version(
         )
 
     # Step 5: Verify the exact EIC-approved PDF.
-    upload_root = (BASE_DIR / "uploads" / "initial_editing").resolve()
-    pdf_path = (BASE_DIR / submission.file_path).resolve()
+    upload_root = guard_demo_path(BASE_DIR / "uploads" / "initial_editing").resolve()
+    pdf_path = guard_demo_path(BASE_DIR / submission.file_path).resolve()
 
     if (
         not pdf_path.is_relative_to(upload_root)
@@ -1068,11 +1148,16 @@ def make_eic_decision(
 
     current_round = manuscript.review_round
 
+    progress = review_progress(db, manuscript, current_round)
+    if not progress['can_decide']:
+        raise HTTPException(status_code=409, detail=progress['blocked_reason'])
+
     # Step 3: Get all reviewer assignments for this round.
     assignments = db.scalars(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == manuscript_id,
             ReviewAssignment.review_round == current_round,
+            not_declined(),
         )
     ).all()
 
@@ -1112,7 +1197,7 @@ def make_eic_decision(
 
     # Step 6: Map the decision to the next workflow status.
     status_map = {
-        "accept": "final_editing",
+        "accept": "awaiting_author_agreement",
         "reject": "rejected",
         "revision_required": "revision_required",
     }
@@ -1129,6 +1214,11 @@ def make_eic_decision(
     )
 
     db.add(decision)
+    if decision_data.decision == "accept":
+        db.flush()
+        db.add(AuthorAgreement(manuscript_id=manuscript_id, decision_id=decision.decision_id,
+                               author_id=manuscript.author_id, agreement_version=AGREEMENT_VERSION,
+                               agreement_text=AGREEMENT_TEXT, status="pending"))
 
     # Step 8: Notify the author.
     db.add(
@@ -1215,19 +1305,34 @@ def submit_final_editing(
             detail="Manuscript is not in final editing",
         )
 
-    # Step 3: Verify editor assignment.
-    editor_assignment = db.scalar(
+    # Existing final-editing manuscripts without an agreement retain legacy behavior.
+    agreement = db.scalar(select(AuthorAgreement).where(AuthorAgreement.manuscript_id == manuscript_id).order_by(AuthorAgreement.agreement_id.desc()).limit(1))
+    if agreement is not None and agreement.status != "accepted":
+        raise HTTPException(status_code=409, detail="Author agreement acceptance is required before final editing")
+
+    # New agreements require an accepted final-editor invitation; historical
+    # final-editing records without agreements keep their previous rule.
+    final_invitation = None
+    if agreement is not None:
+        final_invitation = db.scalar(select(FinalEditorInvitation).where(
+            FinalEditorInvitation.manuscript_id == manuscript_id,
+            FinalEditorInvitation.status == 'accepted'))
+        if final_invitation is None or final_invitation.editor_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail='Only the accepted final editor may submit')
+        latest = db.scalar(select(FinalEditingSubmission).join(FinalEditingSubmissionInvitation,
+            FinalEditingSubmissionInvitation.submission_id == FinalEditingSubmission.submission_id).where(
+            FinalEditingSubmission.manuscript_id == manuscript_id).order_by(FinalEditingSubmission.submission_id.desc()).limit(1))
+        if latest is not None and latest.status not in ('eic_revision_requested', 'author_revision_requested'):
+            raise HTTPException(status_code=409, detail='The current final edit is awaiting review or already approved')
+    else:
+        editor_assignment = db.scalar(
         select(ReviewAssignment).where(
             ReviewAssignment.manuscript_id == manuscript_id,
             ReviewAssignment.assigned_by == current_user.user_id,
         )
-    )
-
-    if editor_assignment is None:
-        raise HTTPException(
-            status_code=403,
-            detail="You are not an assigned editor for this manuscript",
         )
+        if editor_assignment is None:
+            raise HTTPException(status_code=403, detail="You are not an assigned editor for this manuscript")
 
     # Step 4: Prevent multiple pending submissions.
     pending_submission = db.scalar(
@@ -1277,7 +1382,7 @@ def submit_final_editing(
         )
 
     # Step 7: Save final edited PDF.
-    upload_dir = (
+    upload_dir = guard_demo_path(
         BASE_DIR / "uploads" / "final_editing" / str(manuscript_id)
     )
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -1320,7 +1425,7 @@ def submit_final_editing(
         editor_id=current_user.user_id,
         file_path=str(file_path.relative_to(BASE_DIR)),
         comments=comments,
-        status="pending_author",
+        status="pending_eic" if final_invitation else "pending_author",
     )
 
     db.add(submission)
@@ -1328,7 +1433,7 @@ def submit_final_editing(
     # Step 9: Notify author.
     db.add(
         Notification(
-            user_id=manuscript.author_id,
+            user_id=final_invitation.invited_by if final_invitation else manuscript.author_id,
             manuscript_id=manuscript_id,
             notification_type="final_editing_submitted",
             message=(
@@ -1341,6 +1446,9 @@ def submit_final_editing(
 
     # Step 10: Commit.
     try:
+        db.flush()
+        if final_invitation:
+            db.add(FinalEditingSubmissionInvitation(submission_id=submission.submission_id, invitation_id=final_invitation.invitation_id))
         db.commit()
         db.refresh(submission)
 
@@ -1416,14 +1524,14 @@ def download_final_editing_pdf(
         )
 
     # Step 4: Resolve the PDF path safely.
-    upload_root = (
+    upload_root = guard_demo_path(
         BASE_DIR
         / "uploads"
         / "final_editing"
         / str(manuscript.manuscript_id)
     ).resolve()
 
-    pdf_path = (BASE_DIR / submission.file_path).resolve()
+    pdf_path = guard_demo_path(BASE_DIR / submission.file_path).resolve()
 
     if (
         not pdf_path.is_relative_to(upload_root)
